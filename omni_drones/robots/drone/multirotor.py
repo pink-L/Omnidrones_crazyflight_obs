@@ -295,39 +295,53 @@ class MultirotorBase(RobotBase):
             )
 
         # Isaac Sim 5.1: applying forces to any body in an articulation resets
-        # forces on all other bodies. Combine rotor thrusts and base_link forces
-        # into a single call through the articulation's body view.
-        # Build a combined force array for all bodies in the articulation.
-        num_bodies = self._view.num_bodies  # base_link + rotors
-        combined_forces = torch.zeros(
-            self._view.count, num_bodies, 3, device=self.device
-        )
-        combined_torques = torch.zeros_like(combined_forces)
+        # forces on all other bodies. When the drone is an articulation, combine
+        # all forces into a single call through the articulation's physics view.
+        if self.is_articulation and hasattr(self._view, 'num_bodies'):
+            num_bodies = self._view.num_bodies
+            combined_forces = torch.zeros(
+                self._view.count, num_bodies, 3, device=self.device
+            )
+            combined_torques = torch.zeros_like(combined_forces)
 
-        # Base link is body 0, rotors follow
-        combined_forces[:, 0, :] = self.forces.reshape(-1, 3)
-        combined_torques[:, 0, :] = self.torques.reshape(-1, 3)
+            # Base link is body 0, rotors follow
+            combined_forces[:, 0, :] = self.forces.reshape(-1, 3)
+            combined_torques[:, 0, :] = self.torques.reshape(-1, 3)
 
-        # Rotor thrusts go into bodies 1..num_rotors (local frame, need rotation)
-        # Since we need local-frame forces on rotors, rotate thrusts to global
-        rotor_pos, rotor_rot = self.rotors_view.get_world_poses()
-        global_thrusts = quat_rotate(
-            rotor_rot.flatten(end_dim=-2),
-            self.thrusts.reshape(-1, 3)
-        )
-        combined_forces[:, 1:1+self.num_rotors, :] = global_thrusts.reshape(
-            self._view.count, self.num_rotors, 3
-        )
+            # Rotate local-frame rotor thrusts to global frame
+            rotor_pos, rotor_rot = self.rotors_view.get_world_poses()
+            global_thrusts = quat_rotate(
+                rotor_rot.flatten(end_dim=-2),
+                self.thrusts.reshape(-1, 3)
+            )
+            combined_forces[:, 1:1+self.num_rotors, :] = global_thrusts.reshape(
+                self._view.count, self.num_rotors, 3
+            )
 
-        # Apply all forces in one call (global frame)
-        all_indices = torch.arange(self._view.count, device=self.device, dtype=torch.int32)
-        self._view._physics_view.apply_forces_and_torques_at_position(
-            combined_forces.reshape(-1, 3),
-            combined_torques.reshape(-1, 3),
-            position_data=None,
-            indices=all_indices,
-            is_global=True,
-        )
+            all_indices = torch.arange(self._view.count, device=self.device, dtype=torch.int32)
+            self._view._physics_view.apply_forces_and_torques_at_position(
+                combined_forces.reshape(-1, 3),
+                combined_torques.reshape(-1, 3),
+                position_data=None,
+                indices=all_indices,
+                is_global=True,
+            )
+        else:
+            # Non-articulation (e.g. transport group) — apply separately
+            # Convert rotor thrusts to global frame
+            rotor_pos, rotor_rot = self.rotors_view.get_world_poses()
+            global_thrusts = quat_rotate(
+                rotor_rot.flatten(end_dim=-2),
+                self.thrusts.reshape(-1, 3)
+            )
+            self.rotors_view.apply_forces_and_torques_at_pos(
+                global_thrusts, is_global=True
+            )
+            self.base_link.apply_forces_and_torques_at_pos(
+                self.forces.reshape(-1, 3),
+                self.torques.reshape(-1, 3),
+                is_global=True
+            )
         self.throttle_difference[:] = torch.norm(self.throttle - last_throttle, dim=-1)
         return self.throttle.sum(-1)
 

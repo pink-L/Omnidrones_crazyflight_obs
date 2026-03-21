@@ -188,16 +188,10 @@ class OveractuatedPlatform(RobotBase):
                 ],
             )
             for drone_prim in drone_prims:
-                execute(
-                    "UnapplyAPISchema",
-                    api=UsdPhysics.ArticulationRootAPI,
-                    prim=drone_prim,
-                )
-                execute(
-                    "UnapplyAPISchema",
-                    api=PhysxSchema.PhysxArticulationAPI,
-                    prim=drone_prim,
-                )
+                # Isaac Sim 5.1: UnapplyAPISchema command was removed.
+                # Remove articulation root APIs directly via USD.
+                drone_prim.RemoveAPI(UsdPhysics.ArticulationRootAPI)
+                drone_prim.RemoveAPI(PhysxSchema.PhysxArticulationAPI)
 
             self._create_frame(
                 f"/World/envs/env_0/{self.name}_{i}/frame",

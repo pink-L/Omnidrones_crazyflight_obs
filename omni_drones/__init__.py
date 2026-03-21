@@ -33,9 +33,14 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), os.path.pardir, "cfg")
 def init_simulation_app(cfg):
     # launch the simulator
     config = {"headless": cfg["headless"], "anti_aliasing": 1}
-    # Isaac Sim 5.1: let SimulationApp pick the default experience
-    # which handles both headless and GUI modes correctly
-    simulation_app = SimulationApp(config)
+    # Isaac Sim 5.1: use base.kit for GUI (includes viewport), base.python.kit for headless
+    import isaacsim as _isaacsim
+    _isaacsim_path = os.path.dirname(_isaacsim.__file__)
+    if cfg["headless"]:
+        _exp = os.path.join(_isaacsim_path, "apps", "isaacsim.exp.base.python.kit")
+    else:
+        _exp = os.path.join(_isaacsim_path, "apps", "isaacsim.exp.base.kit")
+    simulation_app = SimulationApp(config, experience=_exp)
     return simulation_app
 
 

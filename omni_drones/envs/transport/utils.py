@@ -136,16 +136,11 @@ class TransportationGroup(RobotBase):
                     translations=drone_translations[i],
                     prim_paths=[f"{prim_path}/{self.drone.name.lower()}_{i}"],
                 )[0]
-                execute(
-                    "UnapplyAPISchema",
-                    api=UsdPhysics.ArticulationRootAPI,
-                    prim=drone_prim,
-                )
-                execute(
-                    "UnapplyAPISchema",
-                    api=PhysxSchema.PhysxArticulationAPI,
-                    prim=drone_prim,
-                )
+                # Isaac Sim 5.1: UnapplyAPISchema command was removed.
+                # Remove articulation root APIs directly via USD so the
+                # drone becomes part of the parent group articulation.
+                drone_prim.RemoveAPI(UsdPhysics.ArticulationRootAPI)
+                drone_prim.RemoveAPI(PhysxSchema.PhysxArticulationAPI)
 
                 scene_utils.create_bar(
                     prim_path=f"{prim_path}/{self.drone.name.lower()}_{i}/bar",
