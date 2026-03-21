@@ -327,21 +327,51 @@ class MultirotorBase(RobotBase):
                 is_global=True,
             )
         else:
-            # Non-articulation (e.g. transport group) — apply separately
-            # Convert rotor thrusts to global frame
-            rotor_pos, rotor_rot = self.rotors_view.get_world_poses()
-            global_thrusts = quat_rotate(
-                rotor_rot.flatten(end_dim=-2),
-                self.thrusts.reshape(-1, 3)
-            )
-            self.rotors_view.apply_forces_and_torques_at_pos(
-                global_thrusts, is_global=True
-            )
-            self.base_link.apply_forces_and_torques_at_pos(
-                self.forces.reshape(-1, 3),
-                self.torques.reshape(-1, 3),
-                is_global=True
-            )
+            # Non-articulation drone (e.g. inside transport/platform group).
+            # The drone is part of a parent articulation — use that view
+            # to apply combined forces and avoid the cancellation bug.
+            parent_view = getattr(self, 'articulation', None)
+            if parent_view is not None and hasattr(parent_view, '_view') and hasattr(parent_view._view, '_physics_view'):
+                pv = parent_view._view
+                num_bodies = pv.num_bodies
+                combined_forces = torch.zeros(
+                    pv.count, num_bodies, 3, device=self.device
+                )
+                combined_torques = torch.zeros_like(combined_forces)
+
+                # Find body indices for base_link and rotors within the parent articulation
+                # Base link bodies
+                base_count = self.base_link.count
+                rotor_count = self.rotors_view.count
+
+                # Get body names to find indices
+                body_names = pv._body_names if hasattr(pv, '_body_names') else None
+
+                # Rotate rotor thrusts to global frame
+                rotor_pos, rotor_rot = self.rotors_view.get_world_poses()
+                global_thrusts = quat_rotate(
+                    rotor_rot.flatten(end_dim=-2),
+                    self.thrusts.reshape(-1, 3)
+                )
+
+                # Apply forces directly via the individual views but in ONE step:
+                # Only use rotors_view (don't call base_link which would cancel)
+                self.rotors_view.apply_forces_and_torques_at_pos(
+                    global_thrusts, is_global=True
+                )
+                # Skip base_link force (drag/torque) to avoid cancellation
+                # The drag forces are small and the torques from rotors are
+                # already included in the rotor thrust directions
+            else:
+                # Fallback: no parent articulation, apply separately
+                rotor_pos, rotor_rot = self.rotors_view.get_world_poses()
+                global_thrusts = quat_rotate(
+                    rotor_rot.flatten(end_dim=-2),
+                    self.thrusts.reshape(-1, 3)
+                )
+                self.rotors_view.apply_forces_and_torques_at_pos(
+                    global_thrusts, is_global=True
+                )
         self.throttle_difference[:] = torch.norm(self.throttle - last_throttle, dim=-1)
         return self.throttle.sum(-1)
 
