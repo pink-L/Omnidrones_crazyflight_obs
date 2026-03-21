@@ -55,7 +55,7 @@ def create_ground_plane(
     else:
         # get path to the nucleus server
         # assets_root_path = nucleus_utils.get_assets_root_path()
-        assets_root_path = "http://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.1"
+        assets_root_path = "http://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1"
         print("Assets root path: ", assets_root_path)
         if assets_root_path is None:
             carb.log_error("Unable to access the Isaac Sim assets folder on Nucleus server.")
@@ -73,13 +73,16 @@ def create_ground_plane(
     )
     # Apply PhysX Rigid Material schema
     physx_material_api = PhysxSchema.PhysxMaterialAPI.Apply(material.prim)
-    # Set patch friction property
+    # Set patch friction property (removed in newer PhysX versions)
     improve_patch_friction = kwargs.get("improve_patch_friction", False)
-    physx_material_api.CreateImprovePatchFrictionAttr().Set(improve_patch_friction)
+    if hasattr(physx_material_api, 'CreateImprovePatchFrictionAttr'):
+        physx_material_api.CreateImprovePatchFrictionAttr().Set(improve_patch_friction)
     # Set combination mode for coefficients
     combine_mode = kwargs.get("friciton_combine_mode", "multiply")
-    physx_material_api.CreateFrictionCombineModeAttr().Set(combine_mode)
-    physx_material_api.CreateRestitutionCombineModeAttr().Set(combine_mode)
+    if hasattr(physx_material_api, 'CreateFrictionCombineModeAttr'):
+        physx_material_api.CreateFrictionCombineModeAttr().Set(combine_mode)
+    if hasattr(physx_material_api, 'CreateRestitutionCombineModeAttr'):
+        physx_material_api.CreateRestitutionCombineModeAttr().Set(combine_mode)
     # Apply physics material to ground plane
     collision_prim_path = prim_utils.get_prim_path(
         prim_utils.get_first_matching_child_prim(

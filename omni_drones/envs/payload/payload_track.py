@@ -33,11 +33,11 @@ from omni_drones.robots.drone import MultirotorBase
 from omni_drones.views import RigidPrimView
 
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import UnboundedContinuousTensorSpec, CompositeSpec, DiscreteTensorSpec
 from omni.isaac.debug_draw import _debug_draw
 
 from ..utils import lemniscate, scale_time
 from .utils import attach_payload
+from omni_drones.utils.torchrl.compat import CompositeSpec, DiscreteTensorSpec, UnboundedContinuousTensorSpec
 
 class PayloadTrack(IsaacEnv):
     r"""

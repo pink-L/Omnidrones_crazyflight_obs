@@ -28,9 +28,6 @@ from torch.func import vmap
 from tensordict import TensorDict
 from tensordict.utils import expand_right
 from tensordict.nn import TensorDictModule, TensorDictSequential
-from torchrl.data import (
-    DiscreteTensorSpec,
-)
 from .modules.rnn import GRU
 from .modules.networks import ENCODERS_MAP, MLP
 from .common import MyBuffer, soft_update, make_encoder
@@ -38,6 +35,7 @@ import copy
 from tqdm import tqdm
 from omegaconf import OmegaConf
 from collections import defaultdict
+from omni_drones.utils.torchrl.compat import DiscreteTensorSpec
 
 class QMIXPolicy:
     def __init__(

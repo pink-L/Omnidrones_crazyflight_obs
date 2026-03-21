@@ -25,16 +25,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.func import vmap
-from tensordict.nn import TensorDictModule, make_functional
+from tensordict.nn import TensorDictModule
 from tensordict import TensorDict
+from omni_drones.utils.tensordict_compat import make_functional
 
-from torchrl.data import (
-    TensorSpec,
-    BoundedTensorSpec,
-    UnboundedContinuousTensorSpec as UnboundedTensorSpec,
-    CompositeSpec,
-    TensorDictReplayBuffer
-)
+from torchrl.data import UnboundedContinuousTensorSpec as UnboundedTensorSpec, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.data.replay_buffers.samplers import RandomSampler
 from torchrl.objectives.utils import hold_out_net
@@ -252,6 +247,7 @@ def soft_update_td(target_params: TensorDict, params: TensorDict, tau: float):
 
 from .modules.networks import MLP, ENCODERS_MAP
 from .common import make_encoder
+from omni_drones.utils.torchrl.compat import BoundedTensorSpec, CompositeSpec, TensorSpec
 
 
 class Critic(nn.Module):

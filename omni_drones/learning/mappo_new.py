@@ -32,21 +32,21 @@ import einops
 from torch.func import vmap
 from tensordict import TensorDict
 from tensordict.nn import (
+from omni_drones.utils.tensordict_compat import make_functional
     EnsembleModule as _EnsembleModule,
     TensorDictSequential,
     TensorDictModule,
     TensorDictModuleBase,
-    make_functional,
     TensorDictParams
 )
 from torchrl.modules import ProbabilisticActor
-from torchrl.data import TensorSpec, CompositeSpec
 from torchrl.envs.transforms import CatTensors
 from einops.layers.torch import Rearrange, Reduce
 
 from .ppo.common import GAE, make_mlp
 from .modules.distributions import IndependentNormal
 from .utils.valuenorm import ValueNorm1
+from omni_drones.utils.torchrl.compat import CompositeSpec, TensorSpec
 
 def make_transformer(
     obs_spec: CompositeSpec,

@@ -26,10 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tensordict.nn import TensorDictModule
 
-from torchrl.data import (
-    DiscreteTensorSpec,
-    TensorDictReplayBuffer
-)
+from torchrl.data import TensorDictReplayBuffer
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.data.replay_buffers.samplers import RandomSampler
 
@@ -37,6 +34,7 @@ import copy
 from tqdm import tqdm
 from tensordict import TensorDict
 from .common import soft_update, make_encoder
+from omni_drones.utils.torchrl.compat import DiscreteTensorSpec
 
 class DuelingQNetwork(nn.Module):
     def __init__(self, state_size, action_size, hidden_size):

@@ -24,12 +24,7 @@
 import torch
 import torch.distributions as D
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import (
-    UnboundedContinuousTensorSpec,
-    CompositeSpec,
-    BinaryDiscreteTensorSpec,
-    DiscreteTensorSpec
-)
+from torchrl.data import BinaryDiscreteTensorSpec
 
 import omni.isaac.core.utils.torch as torch_utils
 import omni.isaac.core.utils.prims as prim_utils
@@ -44,6 +39,7 @@ from omni_drones.robots.drone import MultirotorBase
 from omni_drones.views import ArticulationView, RigidPrimView
 
 from omni_drones.robots import ASSET_PATH
+from omni_drones.utils.torchrl.compat import CompositeSpec, DiscreteTensorSpec, UnboundedContinuousTensorSpec
 
 class FlyThrough(IsaacEnv):
     r"""

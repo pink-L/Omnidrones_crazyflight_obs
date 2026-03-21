@@ -98,7 +98,14 @@ class RobotBase(abc.ABC):
         orientations=None,
         prim_paths: Sequence[str] = None
     ):
-        if SimulationContext.instance()._physics_sim_view is not None:
+        sim_ctx = SimulationContext.instance()
+        # Isaac Sim 5.1: _physics_sim_view was removed; use _physics_context or
+        # check if the simulation is already playing
+        if hasattr(sim_ctx, '_physics_sim_view') and sim_ctx._physics_sim_view is not None:
+            raise RuntimeError(
+                "Cannot spawn robots after simulation_context.reset() is called."
+            )
+        elif hasattr(sim_ctx, 'is_playing') and sim_ctx.is_playing():
             raise RuntimeError(
                 "Cannot spawn robots after simulation_context.reset() is called."
             )
@@ -160,7 +167,15 @@ class RobotBase(abc.ABC):
         self,
         prim_paths_expr: str = None,
     ):
-        if SimulationContext.instance()._physics_sim_view is None:
+        sim_ctx = SimulationContext.instance()
+        # Isaac Sim 5.1: _physics_sim_view may not exist; check is_playing() as alternative
+        if hasattr(sim_ctx, '_physics_sim_view'):
+            if sim_ctx._physics_sim_view is None:
+                raise RuntimeError(
+                    f"Cannot initialize {self.__class__.__name__} before the simulation context resets."
+                    "Call simulation_context.reset() first."
+                )
+        elif not sim_ctx.is_playing():
             raise RuntimeError(
                 f"Cannot initialize {self.__class__.__name__} before the simulation context resets."
                 "Call simulation_context.reset() first."

@@ -30,17 +30,11 @@ import torch.nn.functional as F
 from torch.func import vmap
 from tensordict import TensorDict
 from tensordict.utils import expand_right
-from tensordict.nn import make_functional, TensorDictModule, TensorDictParams
+from tensordict.nn import TensorDictModule, TensorDictParams
+from omni_drones.utils.tensordict_compat import make_functional
 from torch.optim import lr_scheduler
 
-from torchrl.data import (
-    BoundedTensorSpec,
-    CompositeSpec,
-    MultiDiscreteTensorSpec,
-    DiscreteTensorSpec,
-    TensorSpec,
-    UnboundedContinuousTensorSpec as UnboundedTensorSpec,
-)
+from torchrl.data import UnboundedContinuousTensorSpec as UnboundedTensorSpec
 
 from omni_drones.utils.torchrl.env import AgentSpec
 
@@ -401,6 +395,7 @@ from .modules.distributions import (
 )
 
 from .common import make_encoder
+from omni_drones.utils.torchrl.compat import BoundedTensorSpec, CompositeSpec, DiscreteTensorSpec, MultiDiscreteTensorSpec, TensorSpec
 
 def make_ppo_actor(cfg, observation_spec: TensorSpec, action_spec: TensorSpec):
     encoder = make_encoder(cfg, observation_spec)

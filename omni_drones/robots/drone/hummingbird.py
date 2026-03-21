@@ -24,10 +24,10 @@
 import torch
 
 from omni.isaac.core.prims import RigidPrimView
-from torchrl.data import BoundedTensorSpec, UnboundedContinuousTensorSpec
 
 from omni_drones.robots.drone.multirotor import MultirotorBase
 from omni_drones.robots.robot import ASSET_PATH
+from omni_drones.utils.torchrl.compat import BoundedTensorSpec, UnboundedContinuousTensorSpec
 
 
 class Hummingbird(MultirotorBase):

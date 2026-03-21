@@ -28,7 +28,6 @@ from torch.func import vmap
 import omni.isaac.core.utils.torch as torch_utils
 import omni.isaac.core.utils.prims as prim_utils
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import UnboundedContinuousTensorSpec, CompositeSpec, DiscreteTensorSpec
 
 import omni_drones.utils.kit as kit_utils
 
@@ -40,6 +39,7 @@ from omni_drones.utils.scene import design_scene
 from omni_drones.utils.torch import euler_to_quaternion
 
 from .utils import OveractuatedPlatform, PlatformCfg
+from omni_drones.utils.torchrl.compat import CompositeSpec, DiscreteTensorSpec, UnboundedContinuousTensorSpec
 
 
 

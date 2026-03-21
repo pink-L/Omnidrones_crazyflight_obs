@@ -32,7 +32,7 @@ from omni_drones.views import ArticulationView, RigidPrimView
 from omni_drones.utils.torch import euler_to_quaternion, quat_axis
 
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import UnboundedContinuousTensorSpec, CompositeSpec, DiscreteTensorSpec
+from omni_drones.utils.torchrl.compat import CompositeSpec, DiscreteTensorSpec, UnboundedContinuousTensorSpec
 
 
 def attach_payload(parent_path):

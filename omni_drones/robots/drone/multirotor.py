@@ -28,8 +28,7 @@ import torch
 import torch.distributions as D
 import yaml
 from torch.func import vmap
-from tensordict.nn import make_functional
-from torchrl.data import BoundedTensorSpec, CompositeSpec, UnboundedContinuousTensorSpec
+from omni_drones.utils.tensordict_compat import make_functional
 from tensordict import TensorDict
 
 from omni_drones.views import RigidPrimView
@@ -44,6 +43,7 @@ from dataclasses import dataclass
 from collections import defaultdict
 
 import pprint
+from omni_drones.utils.torchrl.compat import BoundedTensorSpec, CompositeSpec, UnboundedContinuousTensorSpec
 
 
 class MultirotorBase(RobotBase):

@@ -30,7 +30,6 @@ import omni_drones.utils.scene as scene_utils
 from omni.isaac.debug_draw import _debug_draw
 
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import CompositeSpec, UnboundedContinuousTensorSpec, DiscreteTensorSpec
 
 from omni_drones.envs.isaac_env import AgentSpec, IsaacEnv
 from omni_drones.views import RigidPrimView
@@ -41,6 +40,7 @@ from omni_drones.robots.drone import MultirotorBase
 
 from .utils import TransportationGroup, TransportationCfg
 from ..utils import lemniscate, scale_time
+from omni_drones.utils.torchrl.compat import CompositeSpec, DiscreteTensorSpec, UnboundedContinuousTensorSpec
 
 
 class TransportTrack(IsaacEnv):

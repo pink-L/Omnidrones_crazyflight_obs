@@ -25,8 +25,7 @@ from typing import Sequence
 import torch
 from dataclasses import dataclass, field, MISSING, fields, asdict
 
-from torchrl.data import BoundedTensorSpec, UnboundedContinuousTensorSpec, CompositeSpec
-from tensordict.nn import make_functional
+from omni_drones.utils.tensordict_compat import make_functional
 
 import omni.isaac.core.utils.prims as prim_utils
 import omni.physx.scripts.utils as script_utils
@@ -40,6 +39,7 @@ from omni_drones.views import RigidPrimView
 from omni_drones.utils.torch import quat_axis
 
 from collections import defaultdict
+from omni_drones.utils.torchrl.compat import BoundedTensorSpec, CompositeSpec, UnboundedContinuousTensorSpec
 
 @dataclass
 class RotorConfig:
@@ -60,15 +60,15 @@ class RotorConfig:
 @dataclass
 class DragonCfg(RobotCfg):
     num_links: int = 4
-    articulation_props: ArticulationRootPropertiesCfg = ArticulationRootPropertiesCfg(
-        solver_velocity_iteration_count=16, enable_self_collisions=True)
+    articulation_props: ArticulationRootPropertiesCfg = field(default_factory=lambda: ArticulationRootPropertiesCfg(
+        solver_velocity_iteration_count=16, enable_self_collisions=True))
     force_sensor: bool = False
-    rotor_cfg: RotorConfig = RotorConfig(
+    rotor_cfg: RotorConfig = field(default_factory=lambda: RotorConfig(
         directions=torch.tensor([1, -1]),
         force_constants=torch.ones(2) * 7.2e-6,
         moment_constants=torch.ones(2) * 1.08e-7,
         max_rotation_velocities=torch.ones(2) * 800
-    )
+    ))
 
     def __post_init__(self):
         self.rotor_cfg = RotorConfig(**{

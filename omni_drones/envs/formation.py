@@ -31,7 +31,7 @@ from omni_drones.envs.isaac_env import AgentSpec, IsaacEnv, List, Optional
 from omni_drones.utils.torch import cpos, off_diag, others, make_cells, euler_to_quaternion
 from omni_drones.robots.drone import MultirotorBase
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import CompositeSpec, UnboundedContinuousTensorSpec, DiscreteTensorSpec
+from omni_drones.utils.torchrl.compat import CompositeSpec, DiscreteTensorSpec, UnboundedContinuousTensorSpec
 
 REGULAR_HEXAGON = [
     [0, 0, 0],

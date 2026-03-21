@@ -28,11 +28,7 @@ import torch.distributions as D
 from torch.func import vmap
 from omni.isaac.debug_draw import _debug_draw
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import (
-    BinaryDiscreteTensorSpec,
-    CompositeSpec,
-    UnboundedContinuousTensorSpec,
-)
+from torchrl.data import BinaryDiscreteTensorSpec
 
 import omni_drones.utils.kit as kit_utils
 
@@ -42,6 +38,7 @@ from omni_drones.utils.torch import euler_to_quaternion, normalize, quat_rotate
 from omni_drones.views import RigidPrimView
 
 from ..utils import lemniscate, scale_time
+from omni_drones.utils.torchrl.compat import CompositeSpec, UnboundedContinuousTensorSpec
 
 
 def attach_payload(parent_path):

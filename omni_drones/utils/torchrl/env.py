@@ -28,8 +28,8 @@ from typing import Optional, Sequence
 
 from dataclasses import dataclass
 from torchrl.envs import EnvBase
-from torchrl.data import TensorSpec, CompositeSpec
 from tensordict import TensorDictBase
+from omni_drones.utils.torchrl.compat import CompositeSpec, TensorSpec
 
 
 @dataclass

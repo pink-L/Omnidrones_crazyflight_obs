@@ -31,7 +31,6 @@ from omni.isaac.debug_draw import _debug_draw
 import omni_drones.utils.kit as kit_utils
 
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import UnboundedContinuousTensorSpec, CompositeSpec, DiscreteTensorSpec
 
 from omni_drones.envs.isaac_env import AgentSpec, IsaacEnv
 from omni_drones.views import RigidPrimView
@@ -42,6 +41,7 @@ from omni_drones.utils.torch import euler_to_quaternion, quat_rotate
 
 from .utils import OveractuatedPlatform, PlatformCfg
 from ..utils import lemniscate, scale_time
+from omni_drones.utils.torchrl.compat import CompositeSpec, DiscreteTensorSpec, UnboundedContinuousTensorSpec
 
 
 class PlatformTrack(IsaacEnv):

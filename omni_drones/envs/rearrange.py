@@ -32,7 +32,7 @@ from omni_drones.envs.isaac_env import AgentSpec, IsaacEnv, List, Optional
 from omni_drones.utils.torch import cpos, off_diag, others, euler_to_quaternion
 from omni_drones.robots.drone import MultirotorBase
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import CompositeSpec, UnboundedContinuousTensorSpec
+from omni_drones.utils.torchrl.compat import CompositeSpec, UnboundedContinuousTensorSpec
 
 def sample_from_grid(cells: torch.Tensor, n):
     idx = torch.randperm(cells.shape[0], device=cells.device)[:n]

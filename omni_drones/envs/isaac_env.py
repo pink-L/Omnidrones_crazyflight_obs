@@ -37,13 +37,13 @@ from omni.isaac.core.utils.extensions import enable_extension
 from omni.isaac.core.utils.viewports import set_camera_view
 
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import CompositeSpec, TensorSpec, DiscreteTensorSpec
 from torchrl.envs import EnvBase
 
 from omni_drones.robots.robot import RobotBase
 from omni_drones.utils.torchrl import AgentSpec
 
 from omni.isaac.debug_draw import _debug_draw
+from omni_drones.utils.torchrl.compat import CompositeSpec, DiscreteTensorSpec, TensorSpec
 
 class DebugDraw:
     def __init__(self):

@@ -25,11 +25,6 @@ import torch
 import torch.distributions as D
 from torch.func import vmap
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import (
-    CompositeSpec,
-    UnboundedContinuousTensorSpec,
-    DiscreteTensorSpec
-)
 
 import omni.isaac.core.utils.prims as prim_utils
 import omni.physx.scripts.utils as script_utils
@@ -46,6 +41,7 @@ from omni_drones.robots.drone import MultirotorBase
 
 from .utils import TransportationGroup, TransportationCfg
 from ..utils import create_obstacle
+from omni_drones.utils.torchrl.compat import CompositeSpec, DiscreteTensorSpec, UnboundedContinuousTensorSpec
 
 class TransportFlyThrough(IsaacEnv):
     r"""

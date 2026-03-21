@@ -26,7 +26,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as D
 
-from torchrl.data import CompositeSpec, TensorSpec
 from torchrl.modules import ProbabilisticActor
 from torchrl.envs.transforms import CatTensors
 from tensordict import TensorDict
@@ -39,6 +38,7 @@ import logging
 from ..utils.valuenorm import ValueNorm1
 from ..modules.distributions import IndependentNormal
 from .common import GAE
+from omni_drones.utils.torchrl.compat import CompositeSpec, TensorSpec
 
 @dataclass
 class PPOConfig:

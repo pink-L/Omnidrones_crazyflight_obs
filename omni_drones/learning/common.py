@@ -81,9 +81,9 @@ def sample_sub_traj(traj, seq_len):
     return traj[t]
 
 
-from torchrl.data import BoundedTensorSpec, UnboundedContinuousTensorSpec, CompositeSpec, TensorSpec
 from .modules.networks import MLP, ENCODERS_MAP, VISION_ENCODER_MAP, MixedEncoder
 from functools import partial
+from omni_drones.utils.torchrl.compat import BoundedTensorSpec, CompositeSpec, TensorSpec, UnboundedContinuousTensorSpec
 
 def make_encoder(cfg, input_spec: TensorSpec) -> nn.Module:
     if isinstance(input_spec, (BoundedTensorSpec, UnboundedContinuousTensorSpec)):

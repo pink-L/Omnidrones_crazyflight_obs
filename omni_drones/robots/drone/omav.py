@@ -22,10 +22,10 @@
 
 
 import torch
-from torchrl.data import BoundedTensorSpec, UnboundedContinuousTensorSpec
 
 from omni_drones.robots.drone import MultirotorBase
 from omni_drones.robots.robot import ASSET_PATH
+from omni_drones.utils.torchrl.compat import BoundedTensorSpec, UnboundedContinuousTensorSpec
 
 class Omav(MultirotorBase):
 

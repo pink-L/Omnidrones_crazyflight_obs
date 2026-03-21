@@ -33,7 +33,6 @@ from hydra.core.config_store import ConfigStore
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModuleBase, TensorDictModule, TensorDictSequential
 
-from torchrl.data import CompositeSpec, TensorSpec, UnboundedContinuousTensorSpec
 from torchrl.envs import CatTensors, TensorDictPrimer
 from torchrl.modules import ProbabilisticActor
 
@@ -41,6 +40,7 @@ from ..modules.distributions import IndependentNormal
 
 from ..utils.gae import compute_gae
 from ..utils.valuenorm import ValueNorm1
+from omni_drones.utils.torchrl.compat import CompositeSpec, TensorSpec, UnboundedContinuousTensorSpec
 
 
 def make_mlp(num_units):

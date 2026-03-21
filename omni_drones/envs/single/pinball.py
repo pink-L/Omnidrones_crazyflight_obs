@@ -33,14 +33,10 @@ from omni_drones.envs.isaac_env import AgentSpec, IsaacEnv
 from omni_drones.robots.drone import MultirotorBase
 from omni_drones.views import RigidPrimView
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import (
-    UnboundedContinuousTensorSpec,
-    CompositeSpec,
-    DiscreteTensorSpec
-)
 from pxr import UsdShade, PhysxSchema
 
 from omni.isaac.lab.sensors import ContactSensorCfg, ContactSensor
+from omni_drones.utils.torchrl.compat import CompositeSpec, DiscreteTensorSpec, UnboundedContinuousTensorSpec
 
 class Pinball(IsaacEnv):
     """

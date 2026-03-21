@@ -31,20 +31,32 @@ import carb
 from omni.isaac.core.utils.prims import get_prim_parent, get_prim_at_path, set_prim_property, get_prim_property
 from pxr import Usd, UsdGeom, UsdPhysics, PhysxSchema
 from omni.isaac.core.utils.types import JointsState, ArticulationActions
-from omni.isaac.core.articulations import ArticulationView as _ArticulationView
-from omni.isaac.core.prims import RigidPrimView as _RigidPrimView
-from omni.isaac.core.prims import XFormPrimView
 from omni.isaac.core.simulation_context import SimulationContext
 import omni
 import functools
+
+# Isaac Sim 5.1 compat: try the new API first, fallback to deprecated
+try:
+    from isaacsim.core.prims import Articulation as _ArticulationView
+    from isaacsim.core.prims import RigidContactView as _RigidPrimView
+    from isaacsim.core.prims import XFormPrim as XFormPrimView
+    _USING_NEW_API = True
+except ImportError:
+    from omni.isaac.core.articulations import ArticulationView as _ArticulationView
+    from omni.isaac.core.prims import RigidPrimView as _RigidPrimView
+    from omni.isaac.core.prims import XFormPrimView
+    _USING_NEW_API = False
 
 
 def require_sim_initialized(func):
 
     @functools.wraps(func)
     def _func(*args, **kwargs):
-        if SimulationContext.instance()._physics_sim_view is None:
-            raise RuntimeError("SimulationContext not initialzed.")
+        sim_ctx = SimulationContext.instance()
+        # Isaac Sim 5.1 compat: _physics_sim_view may not exist
+        if hasattr(sim_ctx, '_physics_sim_view'):
+            if sim_ctx._physics_sim_view is None:
+                raise RuntimeError("SimulationContext not initialized.")
         return func(*args, **kwargs)
 
     return _func
@@ -64,16 +76,33 @@ class ArticulationView(_ArticulationView):
         shape: Tuple[int, ...] = (-1,),
     ) -> None:
         self.shape = shape
-        super().__init__(
-            prim_paths_expr,
-            name,
-            positions,
-            translations,
-            orientations,
-            scales,
-            visibilities,
-            reset_xform_properties,
-        )
+        # Isaac Sim 5.1 bug workaround: XFormPrim.__init__ calls
+        # get_world_poses(usd=True) but ArticulationView.get_world_poses
+        # doesn't accept the 'usd' kwarg. Monkey-patch temporarily.
+        _orig_gwp = self.__class__.get_world_poses if hasattr(self.__class__, 'get_world_poses') else None
+        if _orig_gwp is not None:
+            import inspect
+            sig = inspect.signature(_orig_gwp)
+            if 'usd' not in sig.parameters:
+                def _patched_get_world_poses(self_inner, *args, **kwargs):
+                    kwargs.pop('usd', None)
+                    return _orig_gwp(self_inner, *args, **kwargs)
+                self.__class__.get_world_poses = _patched_get_world_poses
+        try:
+            super().__init__(
+                prim_paths_expr,
+                name,
+                positions,
+                translations,
+                orientations,
+                scales,
+                visibilities,
+                reset_xform_properties,
+            )
+        finally:
+            # Restore original method
+            if _orig_gwp is not None:
+                self.__class__.get_world_poses = _orig_gwp
 
     @require_sim_initialized
     def initialize(self, physics_sim_view: omni.physics.tensors.SimulationView = None) -> None:
@@ -224,14 +253,17 @@ class ArticulationView(_ArticulationView):
         if not omni.timeline.get_timeline_interface().is_stopped() and self._physics_view is not None:
             if self.num_dof == 0:
                 return None
-            self._physics_sim_view.enable_warnings(False)
+            _psv = getattr(self, '_physics_sim_view', None)
+            if _psv is not None and hasattr(_psv, 'enable_warnings'):
+                _psv.enable_warnings(False)
             joint_positions = self._physics_view.get_dof_position_targets()
             if clone:
                 joint_positions = self._backend_utils.clone_tensor(joint_positions, device=self._device)
             joint_velocities = self._physics_view.get_dof_velocity_targets()
             if clone:
                 joint_velocities = self._backend_utils.clone_tensor(joint_velocities, device=self._device)
-            self._physics_sim_view.enable_warnings(True)
+            if _psv is not None and hasattr(_psv, 'enable_warnings'):
+                _psv.enable_warnings(True)
             # TODO: implement the effort part
             return ArticulationActions(
                 joint_positions=joint_positions,
@@ -248,7 +280,7 @@ class ArticulationView(_ArticulationView):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         indices = self._resolve_env_indices(env_indices)
         if self._physics_view is not None:
-            with disable_warnings(self._physics_sim_view):
+            with disable_warnings(getattr(self, "_physics_sim_view", None)):
                 poses = self._physics_view.get_root_transforms()[indices]
                 poses = torch.unflatten(poses, 0, self.shape)
             if clone:
@@ -264,7 +296,7 @@ class ArticulationView(_ArticulationView):
         orientations: Optional[torch.Tensor] = None,
         env_indices: Optional[torch.Tensor] = None,
     ) -> None:
-        with disable_warnings(self._physics_sim_view):
+        with disable_warnings(getattr(self, "_physics_sim_view", None)):
             indices = self._resolve_env_indices(env_indices)
             poses = self._physics_view.get_root_transforms()
             if positions is not None:
@@ -388,7 +420,7 @@ class ArticulationView(_ArticulationView):
         return super().set_body_masses(values.reshape(-1, self.num_bodies), indices)
 
     def get_force_sensor_forces(self, env_indices: Optional[torch.Tensor] = None, clone: bool = False) -> torch.Tensor:
-        with disable_warnings(self._physics_sim_view):
+        with disable_warnings(getattr(self, "_physics_sim_view", None)):
             forces = torch.unflatten(self._physics_view.get_force_sensor_forces(), 0, self.shape)
         if clone:
             forces = forces.clone()
@@ -471,7 +503,7 @@ class RigidPrimView(_RigidPrimView):
         orientations: Optional[torch.Tensor] = None,
         env_indices: Optional[torch.Tensor] = None,
     ) -> None:
-        with disable_warnings(self._physics_sim_view):
+        with disable_warnings(getattr(self, "_physics_sim_view", None)):
             indices = self._resolve_env_indices(env_indices)
             poses = self._physics_view.get_transforms()
             if positions is not None:
@@ -615,7 +647,9 @@ class RigidPrimView(_RigidPrimView):
 @contextmanager
 def disable_warnings(physics_sim_view):
     try:
-        physics_sim_view.enable_warnings(False)
+        if physics_sim_view is not None and hasattr(physics_sim_view, 'enable_warnings'):
+            physics_sim_view.enable_warnings(False)
         yield
     finally:
-        physics_sim_view.enable_warnings(True)
+        if physics_sim_view is not None and hasattr(physics_sim_view, 'enable_warnings'):
+            physics_sim_view.enable_warnings(True)

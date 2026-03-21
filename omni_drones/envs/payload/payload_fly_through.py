@@ -24,12 +24,7 @@
 import torch
 import torch.distributions as D
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import (
-    UnboundedContinuousTensorSpec,
-    CompositeSpec,
-    BinaryDiscreteTensorSpec,
-    DiscreteTensorSpec
-)
+from torchrl.data import BinaryDiscreteTensorSpec
 
 import omni.isaac.core.objects as objects
 from omni.isaac.debug_draw import _debug_draw
@@ -42,6 +37,7 @@ from omni_drones.views import RigidPrimView
 
 from ..utils import create_obstacle
 from .utils import attach_payload
+from omni_drones.utils.torchrl.compat import CompositeSpec, DiscreteTensorSpec, UnboundedContinuousTensorSpec
 
 class PayloadFlyThrough(IsaacEnv):
     r"""

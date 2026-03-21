@@ -27,13 +27,7 @@ import torch.nn.functional as F
 from tensordict.nn import TensorDictModule
 import numpy as np
 
-from torchrl.data import (
-    TensorSpec,
-    BoundedTensorSpec,
-    UnboundedContinuousTensorSpec as UnboundedTensorSpec,
-    CompositeSpec,
-    TensorDictReplayBuffer
-)
+from torchrl.data import UnboundedContinuousTensorSpec as UnboundedTensorSpec, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.data.replay_buffers.samplers import RandomSampler
 from torchrl.objectives.utils import hold_out_net
@@ -214,6 +208,7 @@ class SACPolicy(object):
 from .modules.networks import MLP
 from .modules.distributions import TanhIndependentNormalModule
 from .common import make_encoder
+from omni_drones.utils.torchrl.compat import BoundedTensorSpec, CompositeSpec, TensorSpec
 
 class Actor(nn.Module):
     def __init__(self,

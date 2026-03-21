@@ -25,7 +25,6 @@ import torch
 import torch.distributions as D
 from torch.func import vmap
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import UnboundedContinuousTensorSpec, CompositeSpec, DiscreteTensorSpec
 
 import omni.isaac.core.objects as objects
 import omni_drones.utils.kit as kit_utils
@@ -38,6 +37,7 @@ from omni_drones.views import RigidPrimView
 
 from ..utils import lemniscate, scale_time
 from .utils import create_pendulum
+from omni_drones.utils.torchrl.compat import CompositeSpec, DiscreteTensorSpec, UnboundedContinuousTensorSpec
 
 
 class InvPendulumTrack(IsaacEnv):

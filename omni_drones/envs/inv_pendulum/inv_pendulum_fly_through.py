@@ -24,11 +24,6 @@
 import torch
 import torch.distributions as D
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import (
-    UnboundedContinuousTensorSpec,
-    CompositeSpec,
-    DiscreteTensorSpec
-)
 
 import omni.isaac.core.objects as objects
 from omni.isaac.debug_draw import _debug_draw
@@ -41,6 +36,7 @@ from omni_drones.views import RigidPrimView
 
 from .utils import create_pendulum
 from ..utils import create_obstacle
+from omni_drones.utils.torchrl.compat import CompositeSpec, DiscreteTensorSpec, UnboundedContinuousTensorSpec
 
 class InvPendulumFlyThrough(IsaacEnv):
     r"""
