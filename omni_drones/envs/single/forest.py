@@ -131,15 +131,15 @@ class Forest(IsaacEnv):
         drone_prim = self.drone.spawn(translations=[(0.0, 0.0, 2.)])[0]
 
         import omni.isaac.lab.sim as sim_utils
-        from omni.isaac.lab.assets import AssetBaseCfg
-        from omni.isaac.lab.sensors import RayCaster, RayCasterCfg, patterns
-        from omni.isaac.lab.terrains import (
+        from isaaclab.assets import AssetBaseCfg
+        from isaaclab.sensors import RayCaster, RayCasterCfg, patterns
+        from isaaclab.terrains import (
             TerrainImporterCfg,
             TerrainImporter,
             TerrainGeneratorCfg,
             HfDiscreteObstaclesTerrainCfg,
         )
-        # from omni.isaac.lab.utils.assets import NVIDIA_NUCLEUS_DIR
+        # from isaaclab.utils.assets import NVIDIA_NUCLEUS_DIR
 
         light = AssetBaseCfg(
             prim_path="/World/light",

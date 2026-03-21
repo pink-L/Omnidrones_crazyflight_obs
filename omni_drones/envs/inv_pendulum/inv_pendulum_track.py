@@ -28,7 +28,10 @@ from tensordict.tensordict import TensorDict, TensorDictBase
 
 import omni.isaac.core.objects as objects
 import omni_drones.utils.kit as kit_utils
-from omni.isaac.debug_draw import _debug_draw
+try:
+    from isaacsim.util.debug_draw import _debug_draw
+except ImportError:
+    from omni.isaac.debug_draw import _debug_draw
 
 from omni_drones.utils.torch import euler_to_quaternion, normalize, quat_rotate
 from omni_drones.envs.isaac_env import AgentSpec, IsaacEnv

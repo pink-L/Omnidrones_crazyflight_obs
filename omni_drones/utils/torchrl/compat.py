@@ -16,5 +16,6 @@ from torchrl.data import (
     UnboundedContinuous as UnboundedContinuousTensorSpec,
     Categorical as DiscreteTensorSpec,
     MultiCategorical as MultiDiscreteTensorSpec,
+    Binary as BinaryDiscreteTensorSpec,
     TensorSpec,
 )

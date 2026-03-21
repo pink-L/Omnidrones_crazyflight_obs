@@ -26,7 +26,10 @@ import torch.distributions as D
 from tensordict.tensordict import TensorDict, TensorDictBase
 
 import omni.isaac.core.objects as objects
-from omni.isaac.debug_draw import _debug_draw
+try:
+    from isaacsim.util.debug_draw import _debug_draw
+except ImportError:
+    from omni.isaac.debug_draw import _debug_draw
 
 import omni_drones.utils.kit as kit_utils
 from omni_drones.utils.torch import euler_to_quaternion, normalize

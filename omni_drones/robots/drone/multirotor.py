@@ -240,28 +240,43 @@ class MultirotorBase(RobotBase):
 
         logging.info(f"Setup randomization:\n" + pprint.pformat(dict(self.randomization)))
 
+    def _apply_rotors(self, cmds: torch.Tensor) -> tuple:
+        """Vectorized rotor computation without vmap.
+
+        Replaces vmap(vmap(self.rotors))(cmds, params) with direct tensor ops.
+        cmds: shape (*self.shape, num_rotors)
+        Uses self.rotor_params which has shape (*self.shape, num_rotors) per field.
+        """
+        target_throttle = torch.sqrt(torch.clamp((cmds + 1) / 2, 0, 1))
+
+        tau = torch.where(
+            target_throttle > self.throttle,
+            self.tau_up,
+            self.tau_down
+        )
+        tau = torch.clamp(tau, 0, 1)
+        self.throttle.add_(tau * (target_throttle - self.throttle))
+
+        t = torch.clamp(torch.square(self.throttle), 0., 1.)
+        thrusts = t * self.KF
+        moments = (t * self.KM) * -self.directions
+
+        return thrusts, moments
+
     def apply_action(self, actions: torch.Tensor) -> torch.Tensor:
         rotor_cmds = actions.expand(*self.shape, self.num_rotors)
         last_throttle = self.throttle.clone()
-        thrusts, moments = vmap(vmap(self.rotors, randomness="different"), randomness="same")(
-            rotor_cmds, self.rotor_params
-        )
+        thrusts, moments = self._apply_rotors(rotor_cmds)
 
         rotor_pos, rotor_rot = self.rotors_view.get_world_poses()
         torque_axis = quat_axis(rotor_rot.flatten(end_dim=-2), axis=2).unflatten(0, (*self.shape, self.num_rotors))
 
         self.thrusts[..., 2] = thrusts
         self.torques[:] = (moments.unsqueeze(-1) * torque_axis).sum(-2)
-        # TODO@btx0424: general rotating rotor
-        if self.is_articulation and self.rotor_joint_indices is not None:
-            rot_vel = (self.throttle * self.directions * self.MAX_ROT_VEL)
-            self._view.set_joint_velocities(
-                rot_vel.reshape(-1, self.num_rotors),
-                joint_indices=self.rotor_joint_indices
-            )
         self.forces.zero_()
         # TODO: global downwash
         if self.n > 1:
+            from torch.func import vmap
             self.forces[:] += vmap(self.downwash)(
                 self.pos,
                 self.pos,
@@ -270,14 +285,48 @@ class MultirotorBase(RobotBase):
             ).sum(-2)
         self.forces[:] += (self.drag_coef * self.masses) * self.vel[..., :3]
 
-        self.rotors_view.apply_forces_and_torques_at_pos(
-            self.thrusts.reshape(-1, 3),
-            is_global=False
+        # Isaac Sim 5.1: set joint velocities BEFORE applying forces,
+        # as set_joint_velocities can clear pending external forces
+        if self.is_articulation and self.rotor_joint_indices is not None:
+            rot_vel = (self.throttle * self.directions * self.MAX_ROT_VEL)
+            self._view.set_joint_velocities(
+                rot_vel.reshape(-1, self.num_rotors),
+                joint_indices=self.rotor_joint_indices
+            )
+
+        # Isaac Sim 5.1: applying forces to any body in an articulation resets
+        # forces on all other bodies. Combine rotor thrusts and base_link forces
+        # into a single call through the articulation's body view.
+        # Build a combined force array for all bodies in the articulation.
+        num_bodies = self._view.num_bodies  # base_link + rotors
+        combined_forces = torch.zeros(
+            self._view.count, num_bodies, 3, device=self.device
         )
-        self.base_link.apply_forces_and_torques_at_pos(
-            self.forces.reshape(-1, 3),
-            self.torques.reshape(-1, 3),
-            is_global=True
+        combined_torques = torch.zeros_like(combined_forces)
+
+        # Base link is body 0, rotors follow
+        combined_forces[:, 0, :] = self.forces.reshape(-1, 3)
+        combined_torques[:, 0, :] = self.torques.reshape(-1, 3)
+
+        # Rotor thrusts go into bodies 1..num_rotors (local frame, need rotation)
+        # Since we need local-frame forces on rotors, rotate thrusts to global
+        rotor_pos, rotor_rot = self.rotors_view.get_world_poses()
+        global_thrusts = quat_rotate(
+            rotor_rot.flatten(end_dim=-2),
+            self.thrusts.reshape(-1, 3)
+        )
+        combined_forces[:, 1:1+self.num_rotors, :] = global_thrusts.reshape(
+            self._view.count, self.num_rotors, 3
+        )
+
+        # Apply all forces in one call (global frame)
+        all_indices = torch.arange(self._view.count, device=self.device, dtype=torch.int32)
+        self._view._physics_view.apply_forces_and_torques_at_position(
+            combined_forces.reshape(-1, 3),
+            combined_torques.reshape(-1, 3),
+            position_data=None,
+            indices=all_indices,
+            is_global=True,
         )
         self.throttle_difference[:] = torch.norm(self.throttle - last_throttle, dim=-1)
         return self.throttle.sum(-1)

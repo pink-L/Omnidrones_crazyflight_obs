@@ -42,7 +42,10 @@ from torchrl.envs import EnvBase
 from omni_drones.robots.robot import RobotBase
 from omni_drones.utils.torchrl import AgentSpec
 
-from omni.isaac.debug_draw import _debug_draw
+try:
+    from isaacsim.util.debug_draw import _debug_draw
+except ImportError:
+    from omni.isaac.debug_draw import _debug_draw
 from omni_drones.utils.torchrl.compat import CompositeSpec, DiscreteTensorSpec, TensorSpec
 
 class DebugDraw:

@@ -24,13 +24,16 @@
 import torch
 import torch.distributions as D
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import BinaryDiscreteTensorSpec
+from omni_drones.utils.torchrl.compat import BinaryDiscreteTensorSpec
 
 import omni.isaac.core.utils.torch as torch_utils
 import omni.isaac.core.utils.prims as prim_utils
 import omni.physx.scripts.utils as script_utils
 import omni.isaac.core.objects as objects
-from omni.isaac.debug_draw import _debug_draw
+try:
+    from isaacsim.util.debug_draw import _debug_draw
+except ImportError:
+    from omni.isaac.debug_draw import _debug_draw
 
 import omni_drones.utils.kit as kit_utils
 from omni_drones.utils.torch import euler_to_quaternion

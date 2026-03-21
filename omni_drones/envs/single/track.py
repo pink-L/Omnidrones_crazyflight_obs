@@ -31,7 +31,10 @@ from torch.func import vmap
 from omni_drones.envs.isaac_env import AgentSpec, IsaacEnv
 from omni_drones.robots.drone import MultirotorBase
 from tensordict.tensordict import TensorDict, TensorDictBase
-from omni.isaac.debug_draw import _debug_draw
+try:
+    from isaacsim.util.debug_draw import _debug_draw
+except ImportError:
+    from omni.isaac.debug_draw import _debug_draw
 
 from ..utils import lemniscate, scale_time
 from omni_drones.utils.torchrl.compat import CompositeSpec, DiscreteTensorSpec, UnboundedContinuousTensorSpec

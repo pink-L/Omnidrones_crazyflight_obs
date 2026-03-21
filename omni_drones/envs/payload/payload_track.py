@@ -33,7 +33,10 @@ from omni_drones.robots.drone import MultirotorBase
 from omni_drones.views import RigidPrimView
 
 from tensordict.tensordict import TensorDict, TensorDictBase
-from omni.isaac.debug_draw import _debug_draw
+try:
+    from isaacsim.util.debug_draw import _debug_draw
+except ImportError:
+    from omni.isaac.debug_draw import _debug_draw
 
 from ..utils import lemniscate, scale_time
 from .utils import attach_payload
