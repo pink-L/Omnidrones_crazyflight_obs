@@ -465,24 +465,41 @@ class RigidPrimView(_RigidPrimView):
         shape: Tuple[int, ...] = (-1,),
     ) -> None:
         self.shape = shape
-        super().__init__(
-            prim_paths_expr,
-            name,
-            positions,
-            translations,
-            orientations,
-            scales,
-            visibilities,
-            reset_xform_properties,
-            masses,
-            densities,
-            linear_velocities,
-            angular_velocities,
-            track_contact_forces,
-            prepare_contact_sensors,
-            disable_stablization,
-            contact_filter_prim_paths_expr,
-        )
+        # Isaac Sim 5.1 bug workaround (same as ArticulationView above):
+        # XFormPrim.__init__ calls self.get_world_poses(usd=True) but our override
+        # doesn't accept the 'usd' kwarg -> swallow it for the duration of __init__.
+        _orig_gwp = self.__class__.get_world_poses if hasattr(self.__class__, "get_world_poses") else None
+        if _orig_gwp is not None:
+            import inspect
+            sig = inspect.signature(_orig_gwp)
+            if "usd" not in sig.parameters:
+                def _patched_get_world_poses(self_inner, *args, **kwargs):
+                    kwargs.pop("usd", None)
+                    return _orig_gwp(self_inner, *args, **kwargs)
+                self.__class__.get_world_poses = _patched_get_world_poses
+        try:
+            super().__init__(
+                prim_paths_expr,
+                name,
+                positions,
+                translations,
+                orientations,
+                scales,
+                visibilities,
+                reset_xform_properties,
+                masses,
+                densities,
+                linear_velocities,
+                angular_velocities,
+                track_contact_forces,
+                prepare_contact_sensors,
+                disable_stablization,
+                contact_filter_prim_paths_expr,
+            )
+        finally:
+            # Restore original method
+            if _orig_gwp is not None:
+                self.__class__.get_world_poses = _orig_gwp
 
     @require_sim_initialized
     def initialize(self, physics_sim_view: omni.physics.tensors.SimulationView = None):

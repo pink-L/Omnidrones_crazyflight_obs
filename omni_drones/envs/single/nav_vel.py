@@ -26,11 +26,22 @@ import torch.distributions as D
 
 from omni_drones.envs.isaac_env import AgentSpec, IsaacEnv
 from omni_drones.robots.drone import MultirotorBase
-from omni_drones.views import ArticulationView
+from omni_drones.views import ArticulationView, RigidPrimView
 from omni_drones.utils.torch import euler_to_quaternion, quat_axis
 
 from tensordict.tensordict import TensorDict, TensorDictBase
 from omni_drones.utils.torchrl.compat import CompositeSpec, UnboundedContinuousTensorSpec
+from omni_drones.envs.utils import create_obstacle
+from omni_drones.envs.single.nav_vel_obstacles import ObstacleManager
+from omni_drones.utils.nav_curriculum import ObstacleCurriculum
+
+
+def _to_plain_dict(obj):
+    """Hydra DictConfig -> plain python dict (None-safe)."""
+    if obj is None:
+        return None
+    from omegaconf import OmegaConf
+    return OmegaConf.to_container(obj, resolve=True)
 
 
 class NavVel(IsaacEnv):
@@ -104,6 +115,28 @@ class NavVel(IsaacEnv):
         self.reward_pbrs_weight = cfg.task.get("reward_pbrs_weight", 0.0)
         self.pbrs_gamma = cfg.task.get("pbrs_gamma", 0.995)
 
+        # ---- [M2 2026-09-04] obstacle / curriculum config ----------------
+        # parsed BEFORE super().__init__ because _design_scene/_set_specs run inside it
+        self._obstacle_cfg = _to_plain_dict(cfg.task.get("obstacle", None))
+        self._curriculum_cfg = _to_plain_dict(cfg.task.get("curriculum", None))
+        self._has_obstacles = bool(self._obstacle_cfg and self._obstacle_cfg.get("max_slots", 0))
+        if self._has_obstacles:
+            oc = self._obstacle_cfg
+            self.K = int(oc["max_slots"])
+            self.obstacle_phys_radius = float(max(oc.get("radius_choices", [0.30])))
+            self.obstacle_collision_margin = float(oc.get("collision_margin", 0.05))
+            self.obstacle_danger_radius = float(oc.get("danger_radius", 0.6))
+            self.obstacle_max_collisions = int(oc.get("max_collisions", 2))
+            self.reward_obs_log_weight = float(oc.get("reward_obs_log_weight", 1.5))
+            self.reward_obs_log_scale = float(oc.get("reward_obs_log_scale", 0.3))
+            self.reward_collision_edge = float(oc.get("reward_collision_edge", 2.0))
+            self.reward_near_slowdown_weight = float(oc.get("reward_near_slowdown_weight", 0.5))
+            self.obstacle_reward_early_death_weight = float(oc.get("reward_early_death_weight", 0.0))
+            self.obstacle_early_death_threshold = float(oc.get("early_death_threshold_steps", 300))
+            self.obstacle_obs_dist_norm = float(oc.get("obs_dist_norm", 5.0))
+        else:
+            self.K = 0
+
         super().__init__(cfg, headless)
 
         self.drone.initialize()
@@ -115,6 +148,43 @@ class NavVel(IsaacEnv):
             reset_xform_properties=False
         )
         self.target_vis.initialize()
+
+        # ---- [M2] obstacle prim view + pure-logic manager + curriculum scheduler ----
+        if self._has_obstacles:
+            self.obstacle_views = RigidPrimView(
+                "/World/envs/env_*/obstacle_*",
+                reset_xform_properties=False,
+                shape=[self.num_envs, self.K],
+            )
+            self.obstacle_views.initialize()
+            self.obstacles = ObstacleManager(self._obstacle_cfg, self.num_envs, self.device)
+
+            cc = self._curriculum_cfg or {}
+            self.curriculum = ObstacleCurriculum(
+                levels=cc.get("levels", [0, 2, 4, 8]),
+                initial_level=int(cc.get("initial_level", 0)),
+                gate_window=int(cc.get("gate_window_episodes", 3000)),
+                success_threshold=float(cc.get("success_rate_threshold", 0.8)),
+                collision_threshold=float(cc.get("collision_rate_threshold", 0.05)),
+                min_frames=float(cc.get("min_frames_between_promote", 2_000_000)),
+                allow_demote=bool(cc.get("allow_demote", False)),
+                device=self.device,
+            )
+            self.curriculum_enabled = bool(cc.get("enabled", True))
+            self.curriculum_levels = list(cc.get("levels", [0, 2, 4, 8]))
+            self.level_idx = self.curriculum.level_idx
+            # per-life / per-episode(600-step window) collision bookkeeping
+            self.ep_collision_edges = torch.zeros(self.num_envs, 1, dtype=torch.long, device=self.device)
+            self.life_collision_edges = torch.zeros(self.num_envs, 1, dtype=torch.long, device=self.device)
+            self.prev_in_collision = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
+        else:
+            self.obstacle_views = None
+            self.obstacles = None
+            self.curriculum = None
+            self.curriculum_enabled = False
+            self.curriculum_levels = []
+            self.level_idx = 0
+
         self.init_poses = self.drone.get_world_poses(clone=True)
         self.init_vels = torch.zeros_like(self.drone.get_velocities())
 
@@ -178,6 +248,19 @@ class NavVel(IsaacEnv):
             restitution=0.0,
         )
         self.drone.spawn(translations=[(0.0, 0.0, 1.5)])[0]
+
+        # [M2 2026-09-04] K kinematic sphere obstacles (template under env_0, GridCloner
+        # copies them into every env). Physical radius fixed to the max logical tier (0.4)
+        # so no per-reset USD radius writes are needed; logical r_o (obs/reward/collision)
+        # is <= physical, thus the geometric decision radius r_s >= physical ball keeps the
+        # geometric detection consistent (triggers at/earlier than physical contact).
+        if self._has_obstacles:
+            for i in range(self.K):
+                create_obstacle(
+                    f"/World/envs/env_0/obstacle_{i}", "Sphere",
+                    translation=(0.0, 0.0, -100.0),
+                    attributes={"radius": self.obstacle_phys_radius},
+                )
         return ["/World/defaultGroundPlane"]
 
     def _set_specs(self):
@@ -187,6 +270,11 @@ class NavVel(IsaacEnv):
         if self.cfg.task.time_encoding:
             self.time_encoding_dim = 4
             observation_dim += self.time_encoding_dim
+
+        # [M2] append K obstacle slots (rpos_xyz(3) + radius(1) per slot): 30 -> 62
+        if self._has_obstacles:
+            self.obstacle_obs_dim = 4 * self.K
+            observation_dim += self.obstacle_obs_dim
 
         self.observation_spec = CompositeSpec({
             "agents": CompositeSpec({
@@ -222,6 +310,12 @@ class NavVel(IsaacEnv):
             "action_smoothness": UnboundedContinuousTensorSpec(1),
             "arrival": UnboundedContinuousTensorSpec(1),   # [M1] EMA of within-radius ratio
             "vel_norm": UnboundedContinuousTensorSpec(1),  # [M1] EMA of speed
+            # [M2] obstacle stats (EpisodeStats samples them at the episode end step)
+            "collision": UnboundedContinuousTensorSpec(1),  # EMA frac. of steps in contact
+            "collision_episodes": UnboundedContinuousTensorSpec(1),  # window had >=1 edge
+            "min_clearance": UnboundedContinuousTensorSpec(1),  # EMA min surface clearance
+            "success_rate": UnboundedContinuousTensorSpec(1),  # window success (arr&0 edge)
+            "curriculum_level": UnboundedContinuousTensorSpec(1),  # active obstacle count
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["stats"] = stats_spec
         self.stats = stats_spec.zero()
@@ -236,6 +330,23 @@ class NavVel(IsaacEnv):
         self.info = info_spec.zero()
 
     def _reset_idx(self, env_ids: torch.Tensor):
+        # [M2] consume finished episode outcomes into the curriculum BEFORE clearing the
+        # per-env window counters below. Only training updates the schedule; eval keeps the
+        # level locked. success = arrived at least once AND zero collision edges (window).
+        if (self._has_obstacles and self.curriculum is not None
+                and self.training and self.curriculum_enabled):
+            ran = self.progress_buf[env_ids] > 0
+            if ran.any():
+                ids = env_ids[ran]
+                arrived = self.episode_any_arrival[ids].squeeze(-1)
+                edges = self.ep_collision_edges[ids].squeeze(-1)
+                success = arrived & (edges == 0)
+                collided = edges > 0
+                self.curriculum.update(
+                    success, collided,
+                    add_frames=float(ran.sum().item()) * float(self.max_episode_length))
+                self.level_idx = self.curriculum.level_idx
+
         self.drone._reset_idx(env_ids, self.training)
 
         n = len(env_ids)
@@ -271,6 +382,18 @@ class NavVel(IsaacEnv):
             env_indices=env_ids
         )
 
+        # ---- [M2] sample fresh obstacle layout for this window (env frame) & move prims ----
+        if self._has_obstacles:
+            n_active = self.curriculum_levels[self.level_idx] if self.curriculum_levels else 0
+            pos_l, rad_l, act_l = self.obstacles.sample_layout(pos, target, n_active)
+            self.obstacles.commit_layout(env_ids, pos_l, rad_l, act_l)
+            wpos = self.obstacles.world_pose_tensor(env_ids, self.envs_positions)
+            self.obstacle_views.set_world_poses(positions=wpos, env_indices=env_ids)
+            # reset per-life / per-window collision bookkeeping
+            self.ep_collision_edges[env_ids] = 0
+            self.life_collision_edges[env_ids] = 0
+            self.prev_in_collision[env_ids] = False
+
         # reset bookkeeping
         self.arrive_timer[env_ids] = 0
         self.arrival_triggered[env_ids] = False
@@ -279,6 +402,9 @@ class NavVel(IsaacEnv):
         # PBRS baseline = initial distance (per-life tracking starts clean)
         self.prev_goal_dist[env_ids] = torch.norm(target - pos, dim=-1)
         self.stats[env_ids] = 0.
+        if self._has_obstacles:
+            self.stats["curriculum_level"][env_ids] = (
+                self.curriculum_levels[self.level_idx] if self.curriculum_levels else 0.0)
 
         # init prev_action to a hover thrust cmd (for controller Transforms)
         self.info[env_ids] = 0.
@@ -298,6 +424,20 @@ class NavVel(IsaacEnv):
         # physics buffers are consistent before we teleport mid-episode.
         self.drone._reset_idx(env_ids, self.training)
         pos = self.init_pos_dist.sample((n, 1)).to(self.device)
+        # [M2] obstacles of this window are static: rejection-sample the respawn pose so
+        # a fresh life never starts inside/next to an obstacle (layout itself is kept).
+        if self._has_obstacles and self.obstacles is not None:
+            for _ in range(12):
+                clr = self.obstacles.clearances_for(env_ids, pos)       # (n,K)
+                dmin = clr.min(dim=-1, keepdim=True).values             # (n,1)
+                bad = (torch.isfinite(dmin) & (dmin < self.obstacle_collision_margin + 0.05))
+                bad = bad.squeeze(-1)                                   # (n,)
+                if not bad.any():
+                    break
+                bidx = bad.nonzero().squeeze(-1)
+                if bidx.numel() == 0:
+                    break
+                pos[bidx] = self.init_pos_dist.sample((bidx.numel(), 1)).to(self.device)
         rpy = self.init_rpy_dist.sample((n, 1)).to(self.device)
         rot = euler_to_quaternion(rpy)
         poses = pos + self.envs_positions[env_ids].unsqueeze(1)
@@ -310,6 +450,10 @@ class NavVel(IsaacEnv):
         # rebase per-life trackers: the teleport must not look like "goal progress"
         self.life_steps[env_ids] = 0
         self.prev_goal_dist[env_ids] = torch.norm(self.target_pos[env_ids] - pos, dim=-1)
+        # [M2] fresh life resets obstacle contact trackers too
+        if self._has_obstacles:
+            self.life_collision_edges[env_ids] = 0
+            self.prev_in_collision[env_ids] = False
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")]
@@ -334,6 +478,13 @@ class NavVel(IsaacEnv):
         if self.time_encoding:
             t = (self.progress_buf / self.max_episode_length).unsqueeze(-1)
             obs.append(t.expand(-1, self.time_encoding_dim).unsqueeze(1))
+        # [M2] obstacle block appended last (first 30 dims stay identical to M1)
+        if self._has_obstacles:
+            drone_pos = self.drone_state[..., :3]
+            self._obs_block = self.obstacles.build_obs(drone_pos)
+            self._obs_dmin = self.obstacles.min_clearance(drone_pos)   # (N,1)
+            self.obstacles.update_min_clearance(drone_pos)
+            obs.append(self._obs_block)
         obs = torch.cat(obs, dim=-1)
 
         return TensorDict(
@@ -397,6 +548,59 @@ class NavVel(IsaacEnv):
                 self.z_ref - z, min=0.0
             )
 
+        # ---- [M2 2026-09-04] obstacle rewards / collision edge / respawn cause ----
+        if self._has_obstacles:
+            drone_pos = self.drone_state[..., :3]
+            clr = self.obstacles.clearances(drone_pos)              # (N,K), inf=inactive
+            dmin = clr.min(dim=-1, keepdim=True).values             # (N,1)
+            finite = torch.isfinite(dmin)
+            in_col = (dmin < self.obstacle_collision_margin) & finite
+            new_edge = in_col & (~self.prev_in_collision)
+            self.prev_in_collision = in_col.clone()                 # respawn resets to False
+            self.life_collision_edges += new_edge.long()
+            self.ep_collision_edges += new_edge.long()
+
+            # 1) obstacle log-distance penalty over active slots in the danger zone
+            if self.reward_obs_log_weight > 0:
+                D = self.obstacle_danger_radius
+                d = clr
+                phi = torch.zeros_like(d)
+                band = (d > 0) & (d <= D)                           # 0 < d <= D
+                phi = torch.where(band, torch.log(d.clamp_min(1e-3) / D), phi)
+                neg = d <= 0                                        # inside the ball
+                phi = torch.where(neg, torch.log(torch.tensor(1e-3 / D, device=self.device))
+                                  + 100.0 * d, phi)
+                reward = reward - self.reward_obs_log_weight * self.reward_obs_log_scale \
+                    * phi.sum(dim=-1, keepdim=True)
+
+            # 2) one-shot collision-edge penalty (only on new contacts)
+            reward = reward - self.reward_collision_edge * new_edge.float()
+
+            # 3) near-obstacle slowdown penalty (optional, default on small)
+            if self.reward_near_slowdown_weight > 0:
+                v_lin = self.drone_state[..., 7:10]                 # (N,1,3) lin velocity
+                active_any = self.obstacles.active.any(-1, keepdim=True)   # (N,1)
+                _, min_idx = clr.min(dim=-1)                        # (N,)
+                pc = self.obstacles.pos.gather(
+                    1, min_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3)
+                ).squeeze(1)                                        # (N,3) nearest center
+                u = torch.nn.functional.normalize(
+                    pc - drone_pos.squeeze(1), dim=-1)              # drone -> obstacle
+                v_par = torch.relu((v_lin.squeeze(1) * u).sum(-1, keepdim=True))
+                slow = self.reward_near_slowdown_weight * v_par * torch.clamp(
+                    1.0 - dmin / self.obstacle_danger_radius, min=0.0)
+                slow = slow * (finite & active_any & (dmin < self.obstacle_danger_radius))
+                reward = reward - slow
+
+            # 4) a life that accumulates max_collisions contacts soft-respawns (kept as a
+            #    separate cause, outside crash/oob, so the drone gets another life)
+            self.collide_exceed = self.life_collision_edges >= self.obstacle_max_collisions
+            if self.obstacle_reward_early_death_weight > 0:
+                scale = (self.obstacle_early_death_threshold
+                         / self.life_steps.clamp(min=1)).clamp(1.0, 10.0)
+                reward = reward - self.obstacle_reward_early_death_weight \
+                    * scale * (new_edge & self.collide_exceed).float()
+
         # --- per-life / termination bookkeeping (spatial bounds, env frame) ---
         self.life_steps += 1
         xyz = self.drone_state[..., :3]
@@ -436,15 +640,19 @@ class NavVel(IsaacEnv):
         # give the drone "another life" toward the SAME target (see _respawn). Episodes
         # then last up to max_episode_length so arrival becomes reachable and long-horizon
         # signal exists (diagnosed: drones fell long before any learning could happen).
+        # [M2] collision-exceed is another (soft) respawn cause when obstacles are on
+        collide_death = torch.zeros_like(misbehave)
+        if self._has_obstacles:
+            collide_death = self.collide_exceed & (~truncated)
         if self.soft_respawn:
             terminated = torch.zeros_like(misbehave)
             # keep masks 1-D for the boolean op to avoid (N,N) broadcast
-            respawn = (misbehave.squeeze(-1) & ~truncated.squeeze(-1))
+            respawn = ((misbehave | collide_death).squeeze(-1) & ~truncated.squeeze(-1))
             ids = respawn.nonzero().squeeze(-1)
             if ids.numel() > 0:
                 self._respawn(ids)
         else:
-            terminated = misbehave
+            terminated = misbehave | collide_death
         if self.success_terminate:
             terminated = terminated | just_arrived
 
@@ -455,6 +663,17 @@ class NavVel(IsaacEnv):
         self.stats["action_smoothness"].lerp_(-self.drone.throttle_difference, (1 - self.alpha))
         self.stats["arrival"].lerp_(inside.float(), (1 - self.alpha))
         self.stats["vel_norm"].lerp_(torch.norm(self.drone.vel[..., :3], dim=-1), (1 - self.alpha))
+        if self._has_obstacles:
+            # sampled by EpisodeStats at the window-end step -> reflects whole window
+            self.stats["collision"].lerp_(in_col.float(), (1 - self.alpha))
+            self.stats["collision_episodes"][:] = (self.ep_collision_edges > 0).float()
+            cap = self.obstacle_obs_dist_norm
+            clr_cap = dmin.clamp(max=cap)
+            clr_cap = torch.where(torch.isfinite(dmin), clr_cap,
+                                  torch.full_like(clr_cap, cap))
+            self.stats["min_clearance"].lerp_(clr_cap, (1 - self.alpha))
+            self.stats["success_rate"][:] = (
+                self.episode_any_arrival & (self.ep_collision_edges == 0)).float()
         self.stats["return"] += reward
         self.stats["episode_len"][:] = self.progress_buf.unsqueeze(1)
 

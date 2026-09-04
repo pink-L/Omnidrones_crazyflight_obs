@@ -107,6 +107,43 @@ def main(cfg):
             drift = torch.norm(pos, dim=-1)
             print(f"  {'xy drift from (0,0)':20s} mean={drift.mean().item():.3f}  max={drift.max().item():.3f}")
 
+    # [M2 2026-09-04] obstacle-aware evaluation (naive nav, no CBF): read the env's
+    # *internal* counters directly after a no-reset rollout so the numbers are honest.
+    #   arrival rate  = fraction of envs that reached AND held the target >= once
+    #   collision rate= collision-edge events / total steps  (edge = new contact)
+    #   min_clearance = per-env min surface clearance over the rollout (distribution)
+    if hasattr(base_env, "_has_obstacles") and base_env._has_obstacles:
+        n_env = base_env.num_envs
+        if hasattr(base_env, "arrival_triggered"):
+            arr = base_env.arrival_triggered.float()
+            print(f"\n========== [eval_ckpt] obstacle metrics (level={base_env.level_idx}, "
+                  f"{base_env.curriculum_levels[base_env.level_idx] if base_env.curriculum_levels else 0} obstacles) ==========")
+            print(f"  {'arrival_rate (arrived&held >=once)':28s} = {arr.mean().item():.3f}  ({arr.sum().item()}/{n_env})")
+            if hasattr(base_env, "ep_collision_edges"):
+                edges = base_env.ep_collision_edges.float()           # per-env edge count
+                n_edges = edges.sum().item()
+                print(f"  {'collision edges (total)':28s} = {n_edges:.0f}  rate={n_edges/(n_env*steps):.4f}")
+                print(f"  {'envs with >=1 collision edge':28s} = {edges.gt(0).sum().item()}/{n_env}  "
+                      f"({edges.gt(0).float().mean().item():.3f})")
+                # joint window success used by the curriculum (arrival & zero edges)
+                if hasattr(base_env, "episode_any_arrival"):
+                    suc = (base_env.episode_any_arrival.squeeze(-1) & (edges.squeeze(-1) == 0)).float()
+                    print(f"  {'joint success (arr & 0 edges)':28s} = {suc.mean().item():.3f}  ({suc.sum().item()}/{n_env})")
+            if hasattr(base_env, "obstacles") and base_env.obstacles is not None:
+                mc = base_env.obstacles.ep_min_clearance.float().squeeze(-1)
+                finite = torch.isfinite(mc)
+                if finite.any():
+                    fmc = mc[finite]
+                    print(f"  {'min_clearance (rollout min, m)':28s} mean={fmc.mean().item():.3f}  "
+                          f"std={fmc.std().item():.3f}  min={fmc.min().item():.3f}  max={fmc.max().item():.3f}  "
+                          f"<0.1 count={(fmc<0.1).sum().item()}/{finite.sum().item()}")
+                else:
+                    print(f"  {'min_clearance':28s} = inf (no active obstacles in eval)")
+            for k in ("collision", "collision_episodes", "min_clearance", "success_rate"):
+                if k in stats.keys():
+                    m, s, lo, hi = r(k)
+                    print(f"  {'stats.'+k:26s} mean={m:+.3f}  std={s:.3f}  min={lo:+.3f}  max={hi:+.3f}")
+
     simulation_app.close()
 
 

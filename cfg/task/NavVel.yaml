@@ -42,15 +42,17 @@ bound_xy: 5.0
 z_min: 0.15
 z_max: 4.5
 
-# [M1 2026-09-04 / guide §1.2+§6] stage-0 convergence fixes (M1 无收敛修复项)
-#  分死因一次性惩罚 + early-death 反比放大 + timeout 惩罚 + PBRS 目标进度
-soft_respawn: true            # 坠地/超界/NaN -> 软重置(重生, 目标不变, episode 续到600)
+# [M1 2026-09-04 / guide §1.2+§6] stage-0 convergence fixes
+# [M2-0 2026-09-04] ⚠️ 默认惩罚 bake-in 为 0 = M1 已验证配方 fixctl-B (run 9eb3e923,
+#   arrival 99%)：soft_respawn + survival 0.1 + PBRS 2.0/γ0.995 + 死亡惩罚全 0 + vel 1.8。
+#   经验证：一次性死亡惩罚与 soft_respawn 多命冲突(return≈-110)。要硬终止惩罚时 CLI/此处开。
+soft_respawn: true            # 坠地/超界/NaN/碰撞超限 -> 软重置(重生, 目标/障碍不变, episode 续到600)
 survival_penalty_weight: 0.1  # r -= λ*max(0, z_ref - z)：掉到 z_ref 以下轻微惩罚
 z_ref: 1.0                    # 存活惩罚高度参考 (m)
-reward_crash_penalty: 20.0    # 坠地一次性惩罚 (§6.4)
-reward_oob_penalty: 20.0      # 飞出边界一次性惩罚 (§6.4)
-reward_timeout_penalty: 10.0  # 600 步内从未到达 -> 一次性惩罚 (§6.4)
-reward_early_death_weight: 2.0    # 开局即死额外惩罚: -w*clamp(T_ed/存活步,1,10) (§6.2)
+reward_crash_penalty: 0.0     # 坠地一次性惩罚 (M2-0: 0=关, fixctl-B)
+reward_oob_penalty: 0.0       # 飞出边界一次性惩罚 (M2-0: 0=关)
+reward_timeout_penalty: 0.0   # 600 步内从未到达 -> 一次性惩罚 (M2-0: 0=关)
+reward_early_death_weight: 0.0    # 开局即死额外惩罚 (M2-0: 0=关; M1 证与多命冲突)
 early_death_threshold_steps: 300  # T_ed
 reward_pbrs_weight: 2.0       # PBRS 目标进度: +w*(d_{t-1} - γ*d_t) (§1.2-3); 0=关
 pbrs_gamma: 0.995
@@ -59,6 +61,61 @@ pbrs_gamma: 0.995
 reward_effort_weight: 0.1
 reward_action_smoothness_weight: 0.0
 reward_distance_scale: 1.6
+
+# ===================================================================================
+# [M2 2026-09-04] static 3D obstacle navigation (kaiwu-inspired sphere model, 3D).
+#   Obstacle = sphere (center p_o + radius r_o, radius sampled per obstacle from
+#   `radius_choices` tiers). Drone treated as sphere radius drone_radius + inflation.
+#   Geometry decision radius  r_s = drone_radius + r_o + inflation.
+#   surface clearance      d_i = ||drone - p_oi|| - r_s   (<0 inside, >0 outside).
+#   Collision (geometric)  d_min < collision_margin;  danger zone  d_min < danger_radius.
+#   Obs block = K slots (rpos_xyz/5 clamp[-1,1], r_o/0.5 clamp[0,1]); 30 -> 62 dims.
+#   obs/碰撞/reward 均用几何半径；CBF 半径(M2-3 才引入)与几何分开，勿混用。
+#   Reachability (NavRL-inspired explicit clearance, 2026-09-04): 保证起点不"生在"障碍里、
+#   且目标到达保持区不被障碍吞掉。公式(相对碰撞球 r_s 的额外净空, 与 r_o 自适应):
+#     dist(obs_center, init) >= r_s + init_clearance   (r_s = r_o + drone_radius + inflation)
+#     dist(obs_center, goal) >= r_s + goal_clearance   (goal 留更大保持余量)
+#   障碍互距:                    dist(oi,oj) >= r_oi + r_oj + min_gap_between
+#   布局失败按 spawn_relax 倍逐轮放松(仍保 init 硬净空), 兜底不挂 reset.
+# -----------------------------------------------------------------------------------
+obstacle:
+  max_slots: 8                  # obs 固定槽位 K（改它需同步改 obs 维度 62 = 30+4K）
+  radius_choices: [0.20, 0.30, 0.40]   # 每障碍从多档随机取半径(用户确认 2026-09-04)
+  spawn_xy_range: [[-2.8, -2.8], [2.8, 2.8]]   # 球心采样范围(env 帧, 给 bound_xy=5 留边)
+  spawn_z_range: [0.6, 3.4]                 # z 采样(保证球完整在场内)
+  drone_radius: 0.15            # Crazyflie 安全包络半径(m)
+  inflation: 0.05               # 障碍膨胀 -> 判定半径 r_s = drone_radius + r_o + inflation
+  collision_margin: 0.05        # d_min < 该值 = 碰撞(几何)
+  danger_radius: 0.6            # d_i < 该值进入 log 距离惩罚 / 近障减速
+  max_collisions: 2             # 单条"命"内碰撞边沿累计达到 -> 软重生(记窗口失败)
+  init_clearance: 0.15          # 起点净空(m, 见上方公式, 出生不触发碰撞)
+  goal_clearance: 0.35          # 目标保持区净空(m, 留可停稳余量)
+  min_gap_between: 0.25         # 障碍球间最小空隙(m)
+  spawn_relax: 0.85             # 布局失败时逐轮把 gap/clearance 乘该因子(不放松 init 硬净空)
+  spawn_relax_rounds: 6
+  # ---- obstacle rewards (m2_plan §4.3, soft-respawn 兼容量级; 每项可单独观测) ----
+  reward_obs_log_weight: 1.5    # 障碍 log 距离惩罚权重 (指南 2.0 -> 先小点防过度保守)
+  reward_obs_log_scale: 0.3     # λ_log (phi 为自然对数, 危险区 0.6m 内 ~O(1) 量级)
+  reward_collision_edge: 2.0    # 每次新进入接触的边沿一次性惩罚 (每步 O(1), 勿学 kaiwu -2500)
+  reward_early_death_weight: 0.0  # 碰撞早死反比重罚(默认关, M1 证与多命冲突; 碰撞率不降再小开<1)
+  early_death_threshold_steps: 300
+  reward_near_slowdown_weight: 0.5  # 近障朝障飞减速惩罚(默认小开, 见 §6.5)
+  # obs 归一化常量
+  obs_dist_norm: 5.0            # rpos 分量 /5 截 [-1,1]
+  obs_radius_norm: 0.5          # r_o /0.5 截 [0,1]
+
+# ---- [M2] curriculum: fixed stages 0->2->4->8 obstacles, success-rate gate --------
+#   所有 env 同 level；level 全局提升；统计在整 episode(600 步窗口)重置时结算。
+#   成功定义 = 本窗口至少到达一次(episode_any_arrival) 且 全窗口碰撞边沿==0。
+curriculum:
+  enabled: true                 # false -> 锁在 initial_level(锁级训练/评估用)
+  levels: [0, 2, 4, 8]          # level index -> 激活障碍数
+  initial_level: 0              # 0=无障碍(M1 基线); 1=2 障; 2=4 障; 3=8 障
+  gate_window_episodes: 3000    # 滚动窗口(episode 数)统计 success/collision rate
+  success_rate_threshold: 0.80  # success_rate >= 该值才可升级
+  collision_rate_threshold: 0.05 # 窗口碰撞率 <= 该值(与 success 同查, 防穿障冲到 80%)
+  min_frames_between_promote: 2_000_000   # 距上次升级最少帧数(env 步)防临界抖动
+  allow_demote: false
 
 # ---- domain randomization (optional, keep off for baseline) ----
 # randomization:
