@@ -174,7 +174,8 @@ class PPOAdaptivePolicy(TensorDictModuleBase):
             in_keys=["loc", "scale"],
             out_keys=[("agents", "action")],
             distribution_class=IndependentNormal,
-            return_log_prob=True
+            return_log_prob=True,
+            log_prob_key="sample_log_prob",
         ).to(self.device)
 
         self.critic = TensorDictSequential(

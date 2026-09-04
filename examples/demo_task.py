@@ -9,7 +9,7 @@ from tqdm import trange
 from omegaconf import OmegaConf
 
 from omni_drones import init_simulation_app
-from torchrl.data import CompositeSpec
+from omni_drones.utils.torchrl.compat import CompositeSpec
 from torchrl.envs.utils import set_exploration_type, ExplorationType
 from omni_drones.utils.torchrl.transforms import (
     FromMultiDiscreteAction,

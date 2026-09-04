@@ -98,7 +98,8 @@ class PPOPolicy(TensorDictModuleBase):
         self.entropy_coef = 0.001
         self.clip_param = 0.1
         self.critic_loss_fn = nn.HuberLoss(delta=10)
-        self.n_agents, self.action_dim = action_spec.shape[-2:]
+        # torchrl >= 0.6: Composite.shape only carries batch dim; use leaf spec shape
+        self.n_agents, self.action_dim = action_spec[("agents", "action")].shape[-2:]
         self.gae = GAE(0.99, 0.95)
 
         fake_input = observation_spec.zero()
@@ -127,7 +128,8 @@ class PPOPolicy(TensorDictModuleBase):
             in_keys=["loc", "scale"],
             out_keys=[("agents", "action")],
             distribution_class=IndependentNormal,
-            return_log_prob=True
+            return_log_prob=True,
+            log_prob_key="sample_log_prob",
         ).to(self.device)
 
         if self.cfg.priv_critic:
@@ -167,7 +169,7 @@ class PPOPolicy(TensorDictModuleBase):
 
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=5e-4)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=5e-4)
-        self.value_norm = ValueNorm1(reward_spec.shape[-2:]).to(self.device)
+        self.value_norm = ValueNorm1(reward_spec[("agents", "reward")].shape[-2:]).to(self.device)
 
     def __call__(self, tensordict: TensorDict):
         self.actor(tensordict)

@@ -34,7 +34,7 @@ from tensordict.nn import TensorDictModule, TensorDictParams
 from omni_drones.utils.tensordict_compat import make_functional
 from torch.optim import lr_scheduler
 
-from torchrl.data import UnboundedContinuousTensorSpec as UnboundedTensorSpec
+from omni_drones.utils.torchrl.compat import UnboundedContinuousTensorSpec as UnboundedTensorSpec
 
 from omni_drones.utils.torchrl.env import AgentSpec
 

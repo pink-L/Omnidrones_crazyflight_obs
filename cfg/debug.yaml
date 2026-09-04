@@ -8,7 +8,7 @@ wandb:
   group: ${oc.select:..task.name}
   run_name: ${oc.select:..task.name,test}
   job_type: train
-  entity: marl-drones
+  entity: fly-hust
   project: gpu-onpolicy
   mode: online # set to 'disabled' when debugging locally
   run_id:

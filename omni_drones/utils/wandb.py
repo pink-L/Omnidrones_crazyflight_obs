@@ -28,6 +28,12 @@ import os
 import wandb
 from omegaconf import OmegaConf
 
+# wandb >= 0.17 removed wandb.util.generate_id; moved to wandb.sdk.lib.runid
+try:
+    from wandb.sdk.lib.runid import generate_id as _generate_id
+except ImportError:  # pragma: no cover - older wandb
+    from wandb.util import generate_id as _generate_id
+
 
 def dict_flatten(a: dict, delim="."):
     """Flatten a dict recursively.
@@ -79,7 +85,7 @@ def init_wandb(cfg):
         kwargs["id"] = wandb_cfg.run_id
         kwargs["resume"] = "must"
     else:
-        kwargs["id"] = wandb.util.generate_id()
+        kwargs["id"] = _generate_id()
     run = wandb.init(**kwargs)
     cfg_dict = dict_flatten(OmegaConf.to_container(cfg))
     run.config.update(cfg_dict)

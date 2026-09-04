@@ -374,10 +374,33 @@ class IsaacEnv(EnvBase):
                 )
             # obtain the rgb data
             rgb_data = self._rgb_annotator.get_data()
-            # convert to numpy array
-            rgb_data = np.frombuffer(rgb_data, dtype=np.uint8).reshape(*rgb_data.shape)
-            # return the rgb data
-            return rgb_data[:, :, :3]
+            # Isaac Sim 5.x: the "rgb" annotator may return a flat buffer or an
+            # array whose shape/dtype differs from the classic (H, W, 4) uint8.
+            # Normalize to an (H, W, C) uint8 numpy array using the configured
+            # render resolution (cfg.viewer.resolution == [width, height]).
+            if isinstance(rgb_data, (bytes, bytearray, memoryview)):
+                arr = np.frombuffer(rgb_data, dtype=np.uint8)
+            else:
+                arr = np.asarray(rgb_data)
+            if arr.size == 0:
+                # annotator data not ready yet (headless/offscreen first frames);
+                # return a black placeholder frame instead of crashing
+                w, h = self.cfg.viewer.resolution
+                return np.zeros((h, w, 3), dtype=np.uint8)
+            if arr.dtype != np.uint8:
+                if np.issubdtype(arr.dtype, np.floating) and arr.max() <= 1.0:
+                    arr = (arr * 255.0).round().clip(0, 255).astype(np.uint8)
+                else:
+                    arr = arr.astype(np.uint8)
+            if arr.ndim == 1:
+                w, h = self.cfg.viewer.resolution
+                arr = arr.reshape(h, w, -1)
+            elif arr.ndim != 3:
+                raise RuntimeError(
+                    f"Unexpected rgb data shape: {arr.shape}"
+                )
+            # return rgb (drop alpha if present)
+            return arr[..., :3]
         else:
             raise NotImplementedError(
                 f"Render mode '{mode}' is not supported. Please use: {self.metadata['render.modes']}."

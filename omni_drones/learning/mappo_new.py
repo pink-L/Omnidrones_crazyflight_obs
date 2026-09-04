@@ -32,13 +32,13 @@ import einops
 from torch.func import vmap
 from tensordict import TensorDict
 from tensordict.nn import (
-from omni_drones.utils.tensordict_compat import make_functional
     EnsembleModule as _EnsembleModule,
     TensorDictSequential,
     TensorDictModule,
     TensorDictModuleBase,
     TensorDictParams
 )
+from omni_drones.utils.tensordict_compat import make_functional
 from torchrl.modules import ProbabilisticActor
 from torchrl.envs.transforms import CatTensors
 from einops.layers.torch import Rearrange, Reduce
@@ -167,7 +167,8 @@ class MAPPO:
             in_keys=["loc", "scale"],
             out_keys=[("agents", "action")],
             distribution_class=IndependentNormal,
-            return_log_prob=True
+            return_log_prob=True,
+            log_prob_key="sample_log_prob",
         ).to(self.device)
 
         self.critic = TensorDictModule(

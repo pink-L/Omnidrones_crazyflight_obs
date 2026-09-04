@@ -27,7 +27,8 @@ import torch.nn.functional as F
 from tensordict.nn import TensorDictModule
 import numpy as np
 
-from torchrl.data import UnboundedContinuousTensorSpec as UnboundedTensorSpec, TensorDictReplayBuffer
+from torchrl.data import TensorDictReplayBuffer
+from omni_drones.utils.torchrl.compat import UnboundedContinuousTensorSpec as UnboundedTensorSpec
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.data.replay_buffers.samplers import RandomSampler
 from torchrl.objectives.utils import hold_out_net

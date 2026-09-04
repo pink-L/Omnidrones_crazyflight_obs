@@ -264,6 +264,7 @@ class PPORNNPolicy(TensorDictModuleBase):
             out_keys=[("agents", "action")],
             distribution_class=IndependentNormal,
             return_log_prob=True,
+            log_prob_key="sample_log_prob",
         ).to(self.device)
 
         self._maybe_init_state(fake_input)

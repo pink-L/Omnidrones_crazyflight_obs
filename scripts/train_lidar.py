@@ -12,7 +12,7 @@ from tqdm import tqdm
 from omegaconf import OmegaConf
 
 from omni_drones import init_simulation_app
-from torchrl.data import CompositeSpec, TensorSpec
+from omni_drones.utils.torchrl.compat import CompositeSpec, TensorSpec
 from torchrl.envs.utils import set_exploration_type, ExplorationType
 from omni_drones.utils.torchrl import SyncDataCollector
 from omni_drones.utils.torchrl.transforms import (
@@ -75,7 +75,8 @@ class PPOPolicy(TensorDictModuleBase):
             in_keys=["loc", "scale"],
             out_keys=[("agents", "action")],
             distribution_class=IndependentNormal,
-            return_log_prob=True
+            return_log_prob=True,
+            log_prob_key="sample_log_prob",
         ).to(self.device)
 
         self.critic = TensorDictModule(
