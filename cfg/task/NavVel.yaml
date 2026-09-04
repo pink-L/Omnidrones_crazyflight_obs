@@ -21,6 +21,10 @@ drone_model:
 
 action_transform: velocity
 
+# [M1 2026-09-04] cap policy velocity command: tanh->[-1,1], scale by max_vel (m/s).
+# Fixes "unbounded velocity -> exploration chaos -> early termination" (see plan §10.5/§11).
+max_vel: 2.5
+
 time_encoding: true
 
 # ---- [M1] random waypoint navigation ----
@@ -28,7 +32,7 @@ target_pos_range: [[-3.0, -3.0, 1.5], [3.0, 3.0, 3.0]]   # (env frame) [low, hig
 init_pos_range:   [[-3.0, -3.0, 1.0], [3.0, 3.0, 2.5]]
 min_init_target_dist: 1.5
 arrive_radius: 0.5
-arrive_hold_steps: 100      # 0.01s * 100 = hold 1 s inside radius
+arrive_hold_steps: 50       # 0.01s * 50 = hold 0.5s inside radius (was 100>avg ep_len)
 arrive_bonus: 5.0
 success_terminate: false    # keep holding after arrival (learn to stop)
 bound_xy: 5.0

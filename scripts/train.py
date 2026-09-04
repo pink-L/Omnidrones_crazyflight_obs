@@ -74,7 +74,7 @@ def main(cfg):
             from omni_drones.controllers import LeePositionController
             from omni_drones.utils.torchrl.transforms import VelController
             controller = LeePositionController(9.81, base_env.drone.params).to(base_env.device)
-            transform = VelController(controller)
+            transform = VelController(controller, max_vel=cfg.task.get("max_vel", None))
             transforms.append(transform)
         elif action_transform == "PIDrate":
             # [SimpleFlight migration 2026-09-04] policy -> CTBR -> rate PID -> motor

@@ -268,14 +268,19 @@ class AttitudeController(Transform):
 class VelController(Transform):
     # [ported from SimpleFlight, 2026-09-04; adapted: _action_spec -> full_action_spec,
     #  and uses controller.compute() because fork LeePositionController implements compute() not forward()]
+    # [M1, 2026-09-04] + configurable velocity cap: policy velocity actions are raw &
+    #  unbounded (unlike PIDRateController which tanh's first). When max_vel is given we
+    #  tanh -> [-1,1] then scale v by max_vel (m/s) and yaw by pi, mirroring PIDRateController.
     def __init__(
         self,
         controller,
         action_key: str = ("agents", "action"),
+        max_vel: float = None,   # m/s cap on [vx,vy,vz]; None = legacy unbounded behavior
     ):
         super().__init__([], in_keys_inv=[("info", "drone_state")])
         self.controller = controller
         self.action_key = action_key
+        self.max_vel = max_vel
 
     def transform_input_spec(self, input_spec: TensorSpec) -> TensorSpec:
         action_spec = input_spec[("full_action_spec", *self.action_key)]
@@ -286,11 +291,18 @@ class VelController(Transform):
     def _inv_call(self, tensordict: TensorDictBase) -> TensorDictBase:
         drone_state = tensordict[("info", "drone_state")][..., :13]
         action = tensordict[self.action_key]
-        target_vel, target_yaw = action.split([3, 1], -1)
+        if self.max_vel is not None:
+            action = torch.tanh(action)
+            scales = action.new_tensor(
+                [self.max_vel, self.max_vel, self.max_vel, torch.pi]
+            )
+        else:
+            scales = action.new_tensor([1.0, 1.0, 1.0, torch.pi])
+        target_vel, target_yaw = (action * scales).split([3, 1], -1)
         cmds = self.controller.compute(
             drone_state,
             target_vel=target_vel,
-            target_yaw=target_yaw * torch.pi
+            target_yaw=target_yaw
         )
         torch.nan_to_num_(cmds, 0.)
         tensordict.set(self.action_key, cmds)
