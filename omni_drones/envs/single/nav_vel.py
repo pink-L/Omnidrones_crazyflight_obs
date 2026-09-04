@@ -95,6 +95,14 @@ class NavVel(IsaacEnv):
         self.soft_respawn = cfg.task.get("soft_respawn", True)
         self.survival_penalty_weight = cfg.task.get("survival_penalty_weight", 0.0)
         self.z_ref = cfg.task.get("z_ref", 1.0)
+        # [M1 2026-09-04 / guide §1.2+§6] stage-0 convergence fixes (all optional)
+        self.reward_timeout_penalty = cfg.task.get("reward_timeout_penalty", 0.0)
+        self.reward_oob_penalty = cfg.task.get("reward_oob_penalty", 0.0)
+        self.reward_crash_penalty = cfg.task.get("reward_crash_penalty", 0.0)
+        self.reward_early_death_weight = cfg.task.get("reward_early_death_weight", 0.0)
+        self.early_death_threshold_steps = cfg.task.get("early_death_threshold_steps", 300)
+        self.reward_pbrs_weight = cfg.task.get("reward_pbrs_weight", 0.0)
+        self.pbrs_gamma = cfg.task.get("pbrs_gamma", 0.995)
 
         super().__init__(cfg, headless)
 
@@ -130,6 +138,10 @@ class NavVel(IsaacEnv):
         # [M1] arrival bookkeeping
         self.arrive_timer = torch.zeros(self.num_envs, 1, dtype=torch.long, device=self.device)
         self.arrival_triggered = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
+        # [M1 2026-09-04] per-life / per-episode trackers (failure penalties + PBRS)
+        self.life_steps = torch.zeros(self.num_envs, 1, dtype=torch.long, device=self.device)
+        self.episode_any_arrival = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
+        self.prev_goal_dist = torch.zeros(self.num_envs, 1, dtype=torch.float32, device=self.device)
 
         # [SimpleFlight migration 2026-09-04]: buffers consumed by controller Transforms
         self.prev_actions = torch.zeros(self.num_envs, 1, 4, device=self.device)
@@ -262,6 +274,10 @@ class NavVel(IsaacEnv):
         # reset bookkeeping
         self.arrive_timer[env_ids] = 0
         self.arrival_triggered[env_ids] = False
+        self.episode_any_arrival[env_ids] = False
+        self.life_steps[env_ids] = 0
+        # PBRS baseline = initial distance (per-life tracking starts clean)
+        self.prev_goal_dist[env_ids] = torch.norm(target - pos, dim=-1)
         self.stats[env_ids] = 0.
 
         # init prev_action to a hover thrust cmd (for controller Transforms)
@@ -291,6 +307,9 @@ class NavVel(IsaacEnv):
         self.drone.set_velocities(self.init_vels[env_ids], env_ids)
         self.arrive_timer[env_ids] = 0
         self.arrival_triggered[env_ids] = False
+        # rebase per-life trackers: the teleport must not look like "goal progress"
+        self.life_steps[env_ids] = 0
+        self.prev_goal_dist[env_ids] = torch.norm(self.target_pos[env_ids] - pos, dim=-1)
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")]
@@ -348,7 +367,17 @@ class NavVel(IsaacEnv):
         )
         just_arrived = (self.arrive_timer >= self.arrive_hold_steps) & (~self.arrival_triggered)
         self.arrival_triggered |= just_arrived
+        self.episode_any_arrival |= just_arrived    # whole-episode flag (kept across respawns)
         reward_arrival = self.arrive_bonus * just_arrived.float()
+
+        # [M1 / guide §1.2-3] PBRS goal-progress (optional, off by default):
+        #   w * (d_{t-1} - gamma * d_t), rebased after spawn/respawn inside _respawn/_reset_idx.
+        if self.reward_pbrs_weight > 0:
+            reward_pbrs = self.reward_pbrs_weight * (
+                self.prev_goal_dist - self.pbrs_gamma * pos_error
+            )
+        else:
+            reward_pbrs = torch.zeros_like(pos_error)
 
         assert reward_pose.shape == reward_up.shape == reward_spin.shape
         reward = (
@@ -357,6 +386,7 @@ class NavVel(IsaacEnv):
             + reward_effort
             + reward_action_smoothness
             + reward_arrival
+            + reward_pbrs
         )
 
         # [M1 2026-09-04] survival penalty: falling below z_ref (diagnosed free-fall).
@@ -367,14 +397,40 @@ class NavVel(IsaacEnv):
                 self.z_ref - z, min=0.0
             )
 
-        # --- [M1] termination: spatial bounds (env frame), NOT fixed-point distance ---
+        # --- per-life / termination bookkeeping (spatial bounds, env frame) ---
+        self.life_steps += 1
         xyz = self.drone_state[..., :3]
         out_of_xy = torch.norm(xyz[..., :2], dim=-1) > self.bound_xy
-        out_of_z = (xyz[..., 2] < self.z_min) | (xyz[..., 2] > self.z_max)
-        hasnan = torch.isnan(self.drone_state).any(-1)
-        misbehave = out_of_xy | out_of_z | hasnan
+        crash = (xyz[..., 2] < self.z_min) | torch.isnan(self.drone_state).any(-1)
+        oob = out_of_xy | (xyz[..., 2] > self.z_max)
+        misbehave = crash | oob
 
         truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1)
+
+        # [M1 / guide §6.2+§6.4] one-shot failure penalties (stage-0 convergence fix):
+        #   crash / oob flat penalties + optional early-death amplifier (kaiwu style).
+        if (self.reward_crash_penalty > 0 or self.reward_oob_penalty > 0
+                or self.reward_early_death_weight > 0):
+            base = torch.zeros_like(reward)
+            if self.reward_crash_penalty > 0:
+                base = base - self.reward_crash_penalty * crash.float()
+            if self.reward_oob_penalty > 0:
+                base = base - self.reward_oob_penalty * oob.float()
+            if self.reward_early_death_weight > 0:
+                died = crash | oob
+                scale = (self.early_death_threshold_steps / self.life_steps.clamp(min=1)).clamp(1.0, 10.0)
+                base = base - self.reward_early_death_weight * scale * died.float()
+            base = base * (~truncated).float()   # don't double-count with timeout on the last step
+            reward = reward + base
+
+        # rebase PBRS baseline to this step's distance (respawned envs overridden below)
+        self.prev_goal_dist[:] = pos_error
+
+        # [M1 / guide §6.4] timeout penalty: episode ended (600) without ever arriving.
+        if self.reward_timeout_penalty > 0:
+            reward = reward - self.reward_timeout_penalty * (
+                truncated & (~self.episode_any_arrival)
+            ).float()
 
         # [M1 2026-09-04] soft-respawn: instead of terminating on crash/out-of-bound,
         # give the drone "another life" toward the SAME target (see _respawn). Episodes
