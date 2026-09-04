@@ -47,6 +47,7 @@ class PPOConfig:
     train_every: int = 32
     ppo_epochs: int = 4
     num_minibatches: int = 16
+    entropy_coef: float = 0.001   # [M2 2026-09-04] was hardcoded; CLI: algo.entropy_coef=
 
     # whether to use privileged information
     priv_actor: bool = False
@@ -95,7 +96,8 @@ class PPOPolicy(TensorDictModuleBase):
         self.cfg = cfg
         self.device = device
 
-        self.entropy_coef = 0.001
+        # [M2 2026-09-04] entropy_coef now configurable (default 0.001, unchanged behaviour)
+        self.entropy_coef = getattr(cfg, "entropy_coef", 0.001)
         self.clip_param = 0.1
         self.critic_loss_fn = nn.HuberLoss(delta=10)
         # torchrl >= 0.6: Composite.shape only carries batch dim; use leaf spec shape
