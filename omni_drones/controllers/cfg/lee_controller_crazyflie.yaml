@@ -1,9 +1,12 @@
 # Lee position controller parameters
 # [SimpleFlight migration 2026-09-04]
-# NOTE: initial gains copied from hummingbird (position/velocity gains act on
-# acceleration and are mass-independent; attitude gains are inertia-normalized).
-# Re-tune for Crazyflie if needed for the velocity-command (M1) experiments.
+# NOTE: attitude/angular-rate gains are premultiplied by I^-1 in code, so the
+# effective angular-accel gains here = raw * I^-1. Hummingbird-copied raw gains
+# (0.7/0.1) gave ~5e4 rad/s^2 on Crazyflie's tiny inertia (1.4e-5) -- far beyond
+# the ~800 rad/s^2 the motors can deliver -> saturated/unstable attitude -> the
+# drone could not hold level and sank even under hover commands (2026-09-04).
+# Re-tuned for Crazyflie: eff attitude bw ~10 rad/s, rate damping ~20.
 position_gain: [4, 4, 4]
 velocity_gain: [2.2, 2.2, 2.2]
-attitude_gain: [0.7, 0.7, 0.035]
-angular_rate_gain: [0.1, 0.1, 0.025]
+attitude_gain: [0.0014, 0.0014, 0.0022]
+angular_rate_gain: [0.00028, 0.00028, 0.00043]
