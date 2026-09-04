@@ -90,6 +90,11 @@ class NavVel(IsaacEnv):
         self.bound_xy = cfg.task.get("bound_xy", 5.0)
         self.z_min = cfg.task.get("z_min", 0.15)
         self.z_max = cfg.task.get("z_max", 4.5)
+        # [M1 2026-09-04] survival / soft-respawn (diagnosed: drones keep falling
+        # before they can learn to hover/navigate, see plan §10.5 + 200M-run record)
+        self.soft_respawn = cfg.task.get("soft_respawn", True)
+        self.survival_penalty_weight = cfg.task.get("survival_penalty_weight", 0.0)
+        self.z_ref = cfg.task.get("z_ref", 1.0)
 
         super().__init__(cfg, headless)
 
@@ -265,6 +270,28 @@ class NavVel(IsaacEnv):
         self.info["prev_action"][env_ids, :, 3] = cmd_init.mean(-1)
         self.prev_actions[env_ids] = self.info["prev_action"][env_ids].clone()
 
+    def _respawn(self, env_ids: torch.Tensor):
+        # [M1 2026-09-04] soft reset on crash/out-of-bound/NaN: teleport to a fresh
+        # random init pose but KEEP the current target & episode progress. This lets
+        # the episode run up to max_episode_length (arrival reachable) while the
+        # agent keeps getting "one more life" toward the same goal.
+        n = len(env_ids)
+        if n == 0:
+            return
+        # same ordering as _reset_idx: reset the drone/articulation view FIRST so the
+        # physics buffers are consistent before we teleport mid-episode.
+        self.drone._reset_idx(env_ids, self.training)
+        pos = self.init_pos_dist.sample((n, 1)).to(self.device)
+        rpy = self.init_rpy_dist.sample((n, 1)).to(self.device)
+        rot = euler_to_quaternion(rpy)
+        poses = pos + self.envs_positions[env_ids].unsqueeze(1)
+        self.drone.set_world_poses(
+            poses, rot, env_ids
+        )
+        self.drone.set_velocities(self.init_vels[env_ids], env_ids)
+        self.arrive_timer[env_ids] = 0
+        self.arrival_triggered[env_ids] = False
+
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")]
         # capture what controller Transform wrote (prev_action always,
@@ -332,6 +359,14 @@ class NavVel(IsaacEnv):
             + reward_arrival
         )
 
+        # [M1 2026-09-04] survival penalty: falling below z_ref (diagnosed free-fall).
+        # r -= lambda * max(0, z_ref - z): mild, only bites while the drone is low.
+        if self.survival_penalty_weight > 0:
+            z = self.drone_state[..., 2]
+            reward = reward - self.survival_penalty_weight * torch.clamp(
+                self.z_ref - z, min=0.0
+            )
+
         # --- [M1] termination: spatial bounds (env frame), NOT fixed-point distance ---
         xyz = self.drone_state[..., :3]
         out_of_xy = torch.norm(xyz[..., :2], dim=-1) > self.bound_xy
@@ -339,10 +374,23 @@ class NavVel(IsaacEnv):
         hasnan = torch.isnan(self.drone_state).any(-1)
         misbehave = out_of_xy | out_of_z | hasnan
 
-        terminated = misbehave
+        truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1)
+
+        # [M1 2026-09-04] soft-respawn: instead of terminating on crash/out-of-bound,
+        # give the drone "another life" toward the SAME target (see _respawn). Episodes
+        # then last up to max_episode_length so arrival becomes reachable and long-horizon
+        # signal exists (diagnosed: drones fell long before any learning could happen).
+        if self.soft_respawn:
+            terminated = torch.zeros_like(misbehave)
+            # keep masks 1-D for the boolean op to avoid (N,N) broadcast
+            respawn = (misbehave.squeeze(-1) & ~truncated.squeeze(-1))
+            ids = respawn.nonzero().squeeze(-1)
+            if ids.numel() > 0:
+                self._respawn(ids)
+        else:
+            terminated = misbehave
         if self.success_terminate:
             terminated = terminated | just_arrived
-        truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1)
 
         # stats (EMA)
         self.stats["pos_error"].lerp_(pos_error, (1 - self.alpha))

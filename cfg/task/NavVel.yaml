@@ -7,7 +7,7 @@ defaults:
 
 env:
   # [M1 2026-09-04] 128 -> 512: RTX5090D 32GB 富余, 提吞吐(采样预算见 plan §8.2.8)
-  num_envs: 512
+  num_envs: 1024
   max_episode_length: 600
 
 # [M1 2026-09-04] Crazyflie @100Hz, velocity-command action layer
@@ -38,6 +38,11 @@ success_terminate: false    # keep holding after arrival (learn to stop)
 bound_xy: 5.0
 z_min: 0.15
 z_max: 4.5
+
+# [M1 2026-09-04] survival / soft-respawn 修复 "下坠学不会"（视频确认 free-fall）
+soft_respawn: true            # 坠地/超界/NaN -> 软重置:原地重生(换随机起点、目标不变、episode 不终断，续到 600 步)
+survival_penalty_weight: 0.1  # r -= λ*max(0, z_ref - z)：掉到 z_ref 以下时轻微惩罚,促使保持高度
+z_ref: 1.0                    # 存活惩罚高度参考 (m)
 
 # ---- rewards (inherited Hover-style) ----
 reward_effort_weight: 0.1
