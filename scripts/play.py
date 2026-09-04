@@ -98,6 +98,14 @@ def main(cfg):
     except KeyError:
         raise NotImplementedError(f"Unknown algorithm: {cfg.algo.name}")
 
+    # [play] optionally load a saved policy and evaluate it deterministically
+    use_deterministic = cfg.get("checkpoint") is not None
+    if use_deterministic:
+        policy.load_state_dict(torch.load(cfg.checkpoint, map_location=cfg.sim.device))
+        print(f"[play] loaded checkpoint from {cfg.checkpoint}")
+        base_env.eval()
+        env.eval()
+
     frames_per_batch = env.num_envs * 32
 
     stats_keys = [
@@ -116,20 +124,21 @@ def main(cfg):
 
     pbar = tqdm(collector)
     env.train()
-    for i, data in enumerate(pbar):
-        info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
-        episode_stats.add(data.to_tensordict())
+    with set_exploration_type(ExplorationType.MODE if use_deterministic else ExplorationType.RANDOM):
+        for i, data in enumerate(pbar):
+            info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
+            episode_stats.add(data.to_tensordict())
 
-        if len(episode_stats) >= base_env.num_envs:
-            stats = {
-                "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item()
-                for k, v in episode_stats.pop().items(True, True)
-            }
-            info.update(stats)
+            if len(episode_stats) >= base_env.num_envs:
+                stats = {
+                    "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item()
+                    for k, v in episode_stats.pop().items(True, True)
+                }
+                info.update(stats)
 
-        print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, float)}))
+            print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, float)}))
 
-        pbar.set_postfix({"rollout_fps": collector._fps, "frames": collector._frames})
+            pbar.set_postfix({"rollout_fps": collector._fps, "frames": collector._frames})
 
     simulation_app.close()
 
