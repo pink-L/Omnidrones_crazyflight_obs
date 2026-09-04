@@ -1,0 +1,31 @@
+name: Hover
+
+defaults:
+  # see https://hydra.cc/docs/advanced/overriding_packages/
+  - /base/env_base@_here_
+  - /base/sim_base@_here_
+
+env:
+  num_envs: 128
+  env_spacing: 6
+
+# [SimpleFlight migration 2026-09-04]
+# Crazyflie rate control / motor lag tuned at 100 Hz (dt=0.01), see SimpleFlight
+sim:
+  dt: 0.01
+  substeps: 1
+
+# [SimpleFlight migration 2026-09-04]
+drone_model:
+  name: Crazyflie
+  controller: null
+
+time_encoding: false
+
+reward_effort_weight: 0.1
+reward_action_smoothness_weight: 0.0
+reward_motion_smoothness_weight: 0.0
+reward_distance_scale: 1.2
+
+# PIDrate (CTBR) or velocity / multidiscrete:N / discrete:N / null
+action_transform: PIDrate

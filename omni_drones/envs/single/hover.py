@@ -165,6 +165,11 @@ class Hover(IsaacEnv):
         self.target_heading = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self.alpha = 0.8
 
+        # [SimpleFlight migration 2026-09-04]: buffers consumed by controller Transforms
+        # (VelController / RateController / AttitudeController / PIDRateController)
+        self.prev_actions = torch.zeros(self.num_envs, 1, 4, device=self.device)
+        self.policy_actions = torch.zeros(self.num_envs, 1, 4, device=self.device)
+
     def _design_scene(self):
         import omni_drones.utils.kit as kit_utils
         import omni.isaac.core.utils.prims as prim_utils
@@ -244,6 +249,15 @@ class Hover(IsaacEnv):
         self.observation_spec["stats"] = stats_spec
         self.stats = stats_spec.zero()
 
+        # [SimpleFlight migration 2026-09-04]: info keys consumed by controller Transforms
+        info_spec = CompositeSpec({
+            "drone_state": UnboundedContinuousTensorSpec((self.drone.n, 13), device=self.device),
+            "prev_action": UnboundedContinuousTensorSpec((self.drone.n, 4), device=self.device),
+            "policy_action": UnboundedContinuousTensorSpec((self.drone.n, 4), device=self.device),
+        }).expand(self.num_envs).to(self.device)
+        self.observation_spec["info"] = info_spec
+        self.info = info_spec.zero()
+
     def _reset_idx(self, env_ids: torch.Tensor):
         self.drone._reset_idx(env_ids, self.training)
 
@@ -277,12 +291,27 @@ class Hover(IsaacEnv):
 
         self.stats[env_ids] = 0.
 
+        # [SimpleFlight migration 2026-09-04]: init prev_action to hover thrust cmd
+        self.info[env_ids] = 0.
+        cmd_init = 2.0 * (self.drone.throttle[env_ids]) ** 2 - 1.0
+        self.info["prev_action"][env_ids, :, 3] = cmd_init.mean(-1)
+        self.prev_actions[env_ids] = self.info["prev_action"][env_ids].clone()
+
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")]
+        # [SimpleFlight migration 2026-09-04]: capture what controller Transform wrote
+        # (prev_action always; policy_action only written by PIDRateController transform)
+        self.info["prev_action"] = tensordict[("info", "prev_action")]
+        if ("info", "policy_action") in tensordict.keys(True, True):
+            self.info["policy_action"] = tensordict[("info", "policy_action")]
+        self.prev_actions = self.info["prev_action"].clone()
+        self.policy_actions = self.info["policy_action"].clone()
         self.effort = self.drone.apply_action(actions)
 
     def _compute_state_and_obs(self):
         self.drone_state = self.drone.get_state()
+        # [SimpleFlight migration 2026-09-04]: keep root_state (13-dim) for controller Transforms
+        self.info["drone_state"][:] = self.drone_state[..., :13]
 
         # relative position and heading
         self.rpos = self.target_pos - self.drone_state[..., :3]
@@ -300,6 +329,7 @@ class Hover(IsaacEnv):
                     "observation": obs,
                     "intrinsics": self.drone.intrinsics,
                 },
+                "info": self.info,
                 "stats": self.stats.clone(),
             },
             self.batch_size,

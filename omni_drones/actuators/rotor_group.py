@@ -43,8 +43,16 @@ class RotorGroup(nn.Module):
         self.throttle = nn.Parameter(torch.zeros(self.num_rotors))
         self.directions = nn.Parameter(torch.as_tensor(rotor_config["directions"]).float())
 
-        self.tau_up = nn.Parameter(0.43 * torch.ones(self.num_rotors))
-        self.tau_down = nn.Parameter(0.43 * torch.ones(self.num_rotors))
+        # [SimpleFlight migration 2026-09-04]: time_constant (seconds) first-order motor lag,
+        # fallback to legacy per-step tau=0.43 when not present in the yaml.
+        self.use_time_constant = "time_constant" in rotor_config
+        if self.use_time_constant:
+            time_constant = torch.as_tensor(rotor_config["time_constant"]).float()
+            self.tau_up = nn.Parameter(time_constant * torch.ones(self.num_rotors))
+            self.tau_down = nn.Parameter(time_constant * torch.ones(self.num_rotors))
+        else:
+            self.tau_up = nn.Parameter(0.43 * torch.ones(self.num_rotors))
+            self.tau_down = nn.Parameter(0.43 * torch.ones(self.num_rotors))
 
         self.f = torch.square
         self.f_inv = torch.sqrt
@@ -56,6 +64,9 @@ class RotorGroup(nn.Module):
 
         tau = torch.where(target_throttle > self.throttle, self.tau_up, self.tau_down)
         tau = torch.clamp(tau, 0, 1)
+        if self.use_time_constant:
+            # first-order motor lag, tau in seconds (SimpleFlight semantics)
+            tau = self.dt / tau.clamp_min(1e-3)
         self.throttle.add_(tau * (target_throttle - self.throttle))
 
         noise = torch.randn_like(self.throttle) * self.noise_scale * 0.

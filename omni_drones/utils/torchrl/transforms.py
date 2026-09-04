@@ -265,6 +265,104 @@ class AttitudeController(Transform):
         return tensordict
 
 
+class VelController(Transform):
+    # [ported from SimpleFlight, 2026-09-04; adapted: _action_spec -> full_action_spec,
+    #  and uses controller.compute() because fork LeePositionController implements compute() not forward()]
+    def __init__(
+        self,
+        controller,
+        action_key: str = ("agents", "action"),
+    ):
+        super().__init__([], in_keys_inv=[("info", "drone_state")])
+        self.controller = controller
+        self.action_key = action_key
+
+    def transform_input_spec(self, input_spec: TensorSpec) -> TensorSpec:
+        action_spec = input_spec[("full_action_spec", *self.action_key)]
+        spec = UnboundedContinuousTensorSpec(action_spec.shape[:-1]+(4,), device=action_spec.device)
+        input_spec[("full_action_spec", *self.action_key)] = spec
+        return input_spec
+
+    def _inv_call(self, tensordict: TensorDictBase) -> TensorDictBase:
+        drone_state = tensordict[("info", "drone_state")][..., :13]
+        action = tensordict[self.action_key]
+        target_vel, target_yaw = action.split([3, 1], -1)
+        cmds = self.controller.compute(
+            drone_state,
+            target_vel=target_vel,
+            target_yaw=target_yaw * torch.pi
+        )
+        torch.nan_to_num_(cmds, 0.)
+        tensordict.set(self.action_key, cmds)
+        return tensordict
+
+
+class PIDRateController(Transform):
+    # [ported from SimpleFlight, 2026-09-04; adapted: _action_spec -> full_action_spec]
+    def __init__(
+        self,
+        controller,
+        action_key: str = ("agents", "action"),
+    ):
+        super().__init__([], in_keys_inv=[("info", "drone_state")])
+        self.controller = controller
+        self.action_key = action_key
+        self.max_thrust = self.controller.max_thrusts.sum(-1)
+        self.target_clip = self.controller.target_clip
+        self.max_thrust_ratio = self.controller.max_thrust_ratio
+        self.min_thrust_ratio = self.controller.min_thrust_ratio
+        self.LPF_coef = self.controller.LPF_coef
+
+    def transform_input_spec(self, input_spec: TensorSpec) -> TensorSpec:
+        action_spec = input_spec[("full_action_spec", *self.action_key)]
+        spec = UnboundedContinuousTensorSpec(action_spec.shape[:-1]+(4,), device=action_spec.device)
+        input_spec[("full_action_spec", *self.action_key)] = spec
+        return input_spec
+
+    def _inv_call(self, tensordict: TensorDictBase) -> TensorDictBase:
+        drone_state = tensordict[("info", "drone_state")][..., :13]
+        action = tensordict[self.action_key]
+
+        action = torch.tanh(action)
+        # action: [-1, 1]
+        tensordict.set(("info", "policy_action"), action)
+        target_rate, target_thrust = action.split([3, 1], -1)
+
+        # raw action error
+        ctbr_action = torch.concat([target_rate, target_thrust], dim=-1)
+        prev_ctbr_action = tensordict[("info", "prev_action")]
+
+        # LPF
+        ctbr_action = self.LPF_coef * ctbr_action + (1.0 - self.LPF_coef) * prev_ctbr_action
+
+        action_error = torch.norm(ctbr_action - prev_ctbr_action, dim = -1)
+        tensordict.set(("stats", "action_error_order1"), action_error)
+        tensordict.set(("info", "prev_action"), ctbr_action)
+
+        # target_rate: [-1, 1], target_thrust: [min_thrust_ratio, max_thrust_ratio]
+        target_thrust = torch.clamp((target_thrust + 1) / 2, min = self.min_thrust_ratio, max = self.max_thrust_ratio)
+        # target_rate[:] = 0.0
+        # target_thrust[:] = 0.6328 # init for hover, (1.0 + cmds) / 2.0
+
+        # scale
+        target_rate = target_rate * 180.0 * self.target_clip
+        target_thrust = target_thrust * 2**16
+
+        cmds, ctbr = self.controller(
+            drone_state,
+            target_rate=target_rate,
+            target_thrust=target_thrust,
+            reset_pid=tensordict['done'].expand(-1, drone_state.shape[1]) # num_drones: drone_state.shape[1]
+        )
+        # cmds[:] = 0.2656405 # init for hover: 2 * hover_throttle^2 - 1
+
+        torch.nan_to_num_(cmds, 0.)
+        tensordict.set(self.action_key, cmds)
+        tensordict.set('ctbr', ctbr)
+        tensordict.set('target_rate', target_rate)
+        return tensordict
+
+
 class History(Transform):
     def __init__(
         self,

@@ -9,7 +9,7 @@ from tqdm import tqdm
 from omegaconf import OmegaConf
 
 from omni_drones import init_simulation_app
-from torchrl.data import CompositeSpec
+from omni_drones.utils.torchrl.compat import CompositeSpec
 from torchrl.envs.utils import set_exploration_type, ExplorationType
 from omni_drones.utils.torchrl import SyncDataCollector
 from omni_drones.utils.torchrl.transforms import (
@@ -66,6 +66,20 @@ def main(cfg):
         elif action_transform.startswith("discrete"):
             nbins = int(action_transform.split(":")[1])
             transform = FromDiscreteAction(nbins=nbins)
+            transforms.append(transform)
+        elif action_transform == "velocity":
+            # [SimpleFlight migration 2026-09-04]
+            from omni_drones.controllers import LeePositionController
+            from omni_drones.utils.torchrl.transforms import VelController
+            controller = LeePositionController(9.81, base_env.drone.params).to(base_env.device)
+            transform = VelController(controller)
+            transforms.append(transform)
+        elif action_transform == "PIDrate":
+            # [SimpleFlight migration 2026-09-04]
+            from omni_drones.controllers import PIDRateController as _PIDRateController
+            from omni_drones.utils.torchrl.transforms import PIDRateController
+            controller = _PIDRateController(cfg.sim.dt, 9.81, base_env.drone.params).to(base_env.device)
+            transform = PIDRateController(controller)
             transforms.append(transform)
         else:
             raise NotImplementedError(f"Unknown action transform: {action_transform}")

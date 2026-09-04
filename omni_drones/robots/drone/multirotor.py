@@ -126,6 +126,8 @@ class MultirotorBase(RobotBase):
 
         rotor_config = self.params["rotor_configuration"]
         self.rotors = RotorGroup(rotor_config, dt=self.dt).to(self.device)
+        # [SimpleFlight migration 2026-09-04]: True when yaml has a rotor time_constant (seconds)
+        self.use_motor_time_constant = "time_constant" in rotor_config
 
         rotor_params = make_functional(self.rotors)
         self.KF_0 = rotor_params["KF"].clone()
@@ -161,6 +163,12 @@ class MultirotorBase(RobotBase):
         self.alpha = 0.9
 
         self.masses = self.base_link.get_masses().clone()
+        # [SimpleFlight migration 2026-09-04]: sync sim mass to the yaml value when
+        # `update_sim: True` is present (Crazyflie SysID mass 0.0321 vs USD asset 0.027).
+        if self.params.get("update_sim", False):
+            mass_yaml = torch.full_like(self.masses, float(self.params["mass"]))
+            self.base_link.set_masses(mass_yaml)
+            self.masses = self.base_link.get_masses().clone()
         self.gravity = self.masses * 9.81
         self.inertias = self.base_link.get_inertias().reshape(*self.shape, 3, 3).diagonal(0, -2, -1)
         # default/initial parameters
@@ -255,6 +263,10 @@ class MultirotorBase(RobotBase):
             self.tau_down
         )
         tau = torch.clamp(tau, 0, 1)
+        if self.use_motor_time_constant:
+            # [SimpleFlight migration 2026-09-04]: first-order motor lag,
+            # tau buffer holds the time constant in seconds -> per-step tau = dt / tau
+            tau = self.dt / tau.clamp_min(1e-3)
         self.throttle.add_(tau * (target_throttle - self.throttle))
 
         t = torch.clamp(torch.square(self.throttle), 0., 1.)
