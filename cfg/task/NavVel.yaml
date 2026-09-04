@@ -6,7 +6,8 @@ defaults:
   - /base/sim_base@_here_
 
 env:
-  num_envs: 128
+  # [M1 2026-09-04] 128 -> 512: RTX5090D 32GB 富余, 提吞吐(采样预算见 plan §8.2.8)
+  num_envs: 512
   max_episode_length: 600
 
 # [M1 2026-09-04] Crazyflie @100Hz, velocity-command action layer
