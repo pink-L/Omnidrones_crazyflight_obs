@@ -1,0 +1,47 @@
+name: NavVel
+
+defaults:
+  # see https://hydra.cc/docs/advanced/overriding_packages/
+  - /base/env_base@_here_
+  - /base/sim_base@_here_
+
+env:
+  num_envs: 128
+  max_episode_length: 600
+
+# [M1 2026-09-04] Crazyflie @100Hz, velocity-command action layer
+sim:
+  dt: 0.01
+  substeps: 1
+
+drone_model:
+  name: Crazyflie
+  controller: null
+
+action_transform: velocity
+
+time_encoding: true
+
+# ---- [M1] random waypoint navigation ----
+target_pos_range: [[-3.0, -3.0, 1.5], [3.0, 3.0, 3.0]]   # (env frame) [low, high]
+init_pos_range:   [[-3.0, -3.0, 1.0], [3.0, 3.0, 2.5]]
+min_init_target_dist: 1.5
+arrive_radius: 0.5
+arrive_hold_steps: 100      # 0.01s * 100 = hold 1 s inside radius
+arrive_bonus: 5.0
+success_terminate: false    # keep holding after arrival (learn to stop)
+bound_xy: 5.0
+z_min: 0.15
+z_max: 4.5
+
+# ---- rewards (inherited Hover-style) ----
+reward_effort_weight: 0.1
+reward_action_smoothness_weight: 0.0
+reward_distance_scale: 1.6
+
+# ---- domain randomization (optional, keep off for baseline) ----
+# randomization:
+#   drone:
+#     train:
+#       mass_scale: [0.9, 1.1]
+#       inertia_scale: [0.9, 1.1]
