@@ -127,7 +127,8 @@ class NavVel(IsaacEnv):
             # [M2 2026-09-05 obs-window] num_scene M = 场景物理障碍数（缓冲区/prim 数）。
             #   M > K -> obs 每步实时取最近 K 个（滑动窗口, obs 恒 62 维）；M <= K 保持固定槽旧语义。
             self.M = int(max(int(oc.get("num_scene") or self.K), self.K))
-            self.obs_window = bool(oc.get("obs_window", self.M > self.K))
+            _ow = oc.get("obs_window")
+            self.obs_window = bool(self.M > self.K) if _ow is None else bool(_ow)
             self.obstacle_phys_radius = float(max(oc.get("radius_choices", [0.30])))
             self.obstacle_collision_margin = float(oc.get("collision_margin", 0.05))
             self.obstacle_danger_radius = float(oc.get("danger_radius", 0.6))

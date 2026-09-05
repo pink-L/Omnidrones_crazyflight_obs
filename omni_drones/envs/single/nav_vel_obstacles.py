@@ -65,7 +65,8 @@ class ObstacleManager:
         #   取最近的 K 个（滑动窗口）；M<=K（默认, num_scene 未设）保持固定槽旧语义。
         self.K = int(cfg.get("max_slots", 8))
         self.M = int(max(int(cfg.get("num_scene") or cfg.get("max_slots", 8)), self.K))
-        self.obs_window = bool(cfg.get("obs_window", self.M > self.K))
+        _ow = cfg.get("obs_window")
+        self.obs_window = bool(self.M > self.K) if _ow is None else bool(_ow)
         self.radius_choices = [float(x) for x in cfg.get("radius_choices", [0.30])]
         self.drone_radius = float(cfg.get("drone_radius", 0.15))
         self.inflation = float(cfg.get("inflation", 0.05))
