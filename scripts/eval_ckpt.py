@@ -19,6 +19,43 @@ from omni_drones.learning import ALGOS
 from torchrl.envs.transforms import TransformedEnv, InitTracker, Compose
 
 
+class _PerturbWrapper(torch.nn.Module):
+    """Wrap a policy to inject command-space perturbation on the raw velocity action
+    BEFORE the CBF velocity filter runs (Compose applies the appended cbf filter first
+    into the env). This tests whether the CBF filter absorbs unsafe commands under
+    uncertainty (CBF-RL robustness claim): modes
+      cmd_gauss  = per-step Gaussian noise on the 3D velocity command,
+      cmd_pulse  = intermittent gust pulses (random direction, a few steps).
+    """
+    def __init__(self, policy, mode, strength):
+        super().__init__()
+        self.policy = policy
+        self.mode = mode
+        self.strength = float(strength)
+        self._t = 0
+        self._pulse_until = 0
+        self._pulse = None
+
+    @torch.no_grad()
+    def forward(self, tensordict):
+        tensordict = self.policy(tensordict)
+        a = tensordict[("agents", "action")]
+        if self.mode == "cmd_gauss":
+            a[..., :3] = a[..., :3] + torch.randn_like(a[..., :3]) * self.strength
+        elif self.mode == "cmd_pulse":
+            if self._t >= self._pulse_until:
+                dur = int(torch.randint(5, 9, (1,)).item())
+                self._pulse_until = self._t + dur
+                d = torch.randn(1, 1, 3)
+                d = d / d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                self._pulse = d * self.strength
+            if self._t < self._pulse_until and self._pulse is not None:
+                a[..., :3] = a[..., :3] + self._pulse.to(a.device)
+        self._t += 1
+        tensordict[("agents", "action")] = a
+        return tensordict
+
+
 @hydra.main(config_path=".", config_name="train", version_base=None)
 def main(cfg):
     OmegaConf.register_new_resolver("eval", eval)
@@ -57,10 +94,16 @@ def main(cfg):
             ))
             # [M2-3] optional CBF velocity filter (appended AFTER VelController so Compose
             # applies it FIRST into the env; same as train.py).
+            # [2026-09-06] +runtime_filter=false disables the CBF filter transform during
+            # eval (policy raw action goes straight to the controller) -> quantifies the
+            # runtime-filter contribution to collision safety under perturbation.
             from omni_drones.utils.cbf import build_cbf_filter
-            cbf_filter = build_cbf_filter(cfg)
-            if cbf_filter is not None:
-                transforms.append(cbf_filter)
+            if bool(cfg.get("runtime_filter", True)):
+                cbf_filter = build_cbf_filter(cfg)
+                if cbf_filter is not None:
+                    transforms.append(cbf_filter)
+            else:
+                print("[eval_ckpt] runtime_filter=false -> CBF velocity filter DISABLED")
         elif action_transform == "PIDrate":
             from omni_drones.controllers import PIDRateController as _PIDRateController
             from omni_drones.utils.torchrl.transforms import PIDRateController
@@ -76,6 +119,16 @@ def main(cfg):
     )
     policy.load_state_dict(torch.load(cfg.checkpoint, map_location=cfg.sim.device))
     print(f"[eval_ckpt] loaded checkpoint from {cfg.checkpoint}")
+
+    # [2026-09-05 CBF-sensitivity] optional command-space perturbation (none default)
+    perturb = str(cfg.get("perturb", "none"))
+    pstrength = float(cfg.get("perturb_strength", 0.3))
+    if perturb in ("cmd_gauss", "cmd_pulse"):
+        policy = _PerturbWrapper(policy, perturb, pstrength)
+        print(f"[eval_ckpt] perturbation mode={perturb} strength={pstrength:.3f} "
+              f"(injected on raw action, before CBF filter)")
+    elif perturb != "none":
+        raise ValueError(f"Unknown perturb mode: {perturb}")
 
     env.eval()
     base_env.eval()
@@ -149,6 +202,13 @@ def main(cfg):
                 if k in stats.keys():
                     m, s, lo, hi = r(k)
                     print(f"  {'stats.'+k:26s} mean={m:+.3f}  std={s:.3f}  min={lo:+.3f}  max={hi:+.3f}")
+            # [2026-09-05 CBF-sensitivity] mean per-step CBF reward-core violation
+            # (EMA, >=0) meaningful only when the env has a CBF reward core / filter.
+            if hasattr(base_env, "cbf_extra") and base_env.cbf_extra is not None and \
+                    "cbf_violation" in stats.keys():
+                m, s, lo, hi = r("cbf_violation")
+                print(f"  {'stats.cbf_violation (per-step, >=0)':26s} mean={m:+.4f}  std={s:.4f}  "
+                      f"max={hi:+.4f}")
 
     simulation_app.close()
 
