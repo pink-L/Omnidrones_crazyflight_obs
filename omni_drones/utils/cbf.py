@@ -19,49 +19,48 @@
 # SOFTWARE.
 
 """
-[M2-3, 2026-09-05] First-order CBF (control-barrier-function) safety layer for
-NavVel's *velocity-command* action layer (see m2_plan.md §5 + navvel_rl_interface.md §2/§6).
+[M2-3, 2026-09-05] NavVel *速度指令* 动作层的一阶 CBF（控制屏障函数，control-barrier-function）
+安全层（参见 m2_plan.md §5 与 navvel_rl_interface.md §2/§6）。
 
-Math (static obstacles, v_o = 0; speed commands -> low-level Lee has lag, so the
-CBF decision radius carries an extra braking allowance on top of the geometric one):
+数学描述（静态障碍物，v_o = 0；速度指令 -> 底层 Lee 控制器存在滞后，因此 CBF 的
+决策半径在几何半径之上还需额外计入一段制动余量）：
 
-    h_i(p)   = ||p - p_oi|| - r_si^cbf          (signed distance to the CBF ball)
+    h_i(p)   = ||p - p_oi|| - r_si^cbf          （到 CBF 球的带符号距离）
     n_i      = (p - p_oi) / ||p - p_oi||
     dot h_i  = n_i^T v
-    CBF constraint:   dot h_i + alpha h_i >= 0  <=>  n_i^T v >= -alpha h_i
+    CBF 约束： dot h_i + alpha h_i >= 0  <=>  n_i^T v >= -alpha h_i
 
     r_si^cbf = r_si + margin + (v_max^2 / (2 a_max))     [r_si = r_drone + r_oi + inflation]
-                                                         (braking / inner-loop allowance)
+                                                         （制动 / 内环余量）
 
-* ``filter_velocity``  projects a nominal speed command into the intersection of the
-  active half-spaces (iterative closed-form: each pass fixes the most-violated one),
-  which is exactly CBF-RL's discrete closed-form filter for many obstacles.
-* ``cbf_violation``     returns the total *pre-filter* constraint violation used by the
-  reward core (soft-CBF / reward_only / hybrid): sum_i min(0, n_i^T v_nom + alpha h_i)
-  (+ optional extra when h_i < 0, i.e. already inside the CBF ball).
+* ``filter_velocity``  将标称速度指令投影到各激活半平面的交集中（迭代闭式求解：
+  每轮只修正违约最严重的那一个约束），这正是 CBF-RL 针对多障碍物的离散闭式滤波器。
+* ``cbf_violation``    返回供奖励核心使用的 *滤波前* 总约束违例量
+  （soft-CBF / reward_only / hybrid）：sum_i min(0, n_i^T v_nom + alpha h_i)
+  （当 h_i < 0，即已进入 CBF 球内部时，可选择额外叠加惩罚项）。
 
-All geometry is pure torch over env-frame positions, unit-testable on CPU (no isaac).
-Ground-truth obstacle inputs (pos / r_safe / active) come from the env's ObstacleManager
-via the tensordict ``("info", "obstacle_cbf")`` channel, so CBF/obs/collision/reward all
-share one source of truth. The CBF radius is deliberately NOT fed to the policy obs.
+所有几何运算均为基于环境坐标系位置的纯 torch 计算，可在 CPU 上做单元测试（无需 isaac）。
+地面真值障碍物输入（pos / r_safe / active）通过 tensordict 的 ``("info", "obstacle_cbf")``
+通道来自环境中的 ObstacleManager，因此 CBF / 观测 / 碰撞 / 奖励共用同一数据源。
+CBF 半径刻意不提供给策略观测。
 """
 
 import torch
 
-try:  # torchrl availability guards import when only pure functions are needed
+try:  # torchrl 可用性守卫：仅需纯函数时避免导入失败
     from torchrl.envs.transforms import Transform
     _TORCHRL = True
-except Exception:  # pragma: no cover - pure-torch tests can run without torchrl
+except Exception:  # pragma: no cover - 纯 torch 测试可不依赖 torchrl
     Transform = object
     _TORCHRL = False
 
 
-# --------------------------------------------------------------------------- radius
+# --------------------------------------------------------------------------- 半径
 def safety_radius_extra(drone_radius, inflation, margin, v_max, a_max,
                         use_brake_term=True):
-    """Clearance added ON TOP of the geometric decision radius r_s = r_drone+r_o+infl.
+    """在几何决策半径 r_s = r_drone+r_o+infl 之上额外增加的净空。
 
-    Returns ``margin + v_max**2/(2 a_max)`` (m) when braking is enabled, else ``margin``.
+    当启用制动项时返回 ``margin + v_max**2/(2 a_max)``（米），否则仅返回 ``margin``。
     """
     extra = float(margin)
     if use_brake_term and a_max is not None and float(a_max) > 0:
@@ -71,42 +70,42 @@ def safety_radius_extra(drone_radius, inflation, margin, v_max, a_max,
 
 def cbf_safety_radius(r_o, drone_radius, inflation, margin, v_max, a_max,
                       use_brake_term=True):
-    """Per-obstacle CBF ball radius (m): geometric r_s + safety/braking extra."""
+    """单个障碍物的 CBF 球半径（米）：几何半径 r_s + 安全/制动余量。"""
     r_s = float(drone_radius) + float(r_o) + float(inflation)
     return r_s + safety_radius_extra(drone_radius, inflation, margin, v_max, a_max,
                                      use_brake_term)
 
 
-# --------------------------------------------------------------- pure torch kernels
+# --------------------------------------------------------------- 纯 torch 核函数
 def _gradients(pos, p_obs):
-    """Distance, outward unit normal and inputs for one obstacle set.
+    """计算到一组障碍物的距离、外法向单位向量及相关输入。
 
-    pos (...,3), p_obs (...,K,3) -> dvec (...,K,3), dist (...,K), n (...,K,3).
-    ``n`` is the OUTWARD normal (obstacle center -> drone), so flying straight at an
-    obstacle gives n.v < 0 and the CBF constraint reads  n.v + alpha*h >= 0.
+    pos (...,3), p_obs (...,K,3) -> dvec (...,K,3), dist (...,K), n (...,K,3)。
+    ``n`` 为向外（由障碍物中心指向无人机）的单位法向量，因此正对障碍物飞行时
+    n.v < 0，CBF 约束写为  n.v + alpha*h >= 0。
     """
-    dvec = pos.unsqueeze(-2) - p_obs                    # center -> drone (outward)
+    dvec = pos.unsqueeze(-2) - p_obs                    # 中心 -> 无人机（向外）
     dist = torch.norm(dvec, dim=-1)                     # (...,K)
-    n = dvec / (dist.unsqueeze(-1) + 1e-6)              # (...,K,3) unit outward normal
+    n = dvec / (dist.unsqueeze(-1) + 1e-6)              # (...,K,3) 单位外法向量
     return dvec, dist, n
 
 
 def filter_velocity(pos, v_nom, p_obs, r_safe, active, alpha, iterations=3):
-    """Iterative closed-form projection of ``v_nom`` into the CBF-safe half-spaces.
+    """把 ``v_nom`` 以迭代闭式方式投影到 CBF 安全半平面的交集内。
 
     Args:
-        pos (...,3): drone env-frame position.
-        v_nom (...,3): nominal (policy) velocity command.
-        p_obs (...,K,3): obstacle centers (env frame). Inactive slots may be anything
-                         (they are masked out by ``active``).
-        r_safe (...,K): CBF ball radius per slot (inactive -> <=0).
-        active (...,K): bool mask (same source as obs/geometry: radius>0).
-        alpha: CBF convergence rate.
-        iterations: number of "fix the most-violated constraint" passes.
+        pos (...,3): 无人机在环境坐标系下的位置。
+        v_nom (...,3): 标称（策略输出的）速度指令。
+        p_obs (...,K,3): 障碍物中心（环境坐标系）。未激活的槽位可以是任意值
+                         （由 ``active`` 掩码屏蔽）。
+        r_safe (...,K): 每个槽位的 CBF 球半径（未激活 -> <=0）。
+        active (...,K): 布尔掩码（与观测/几何同源：半径>0）。
+        alpha: CBF 收敛速率。
+        iterations: "修正违约最严重的约束" 的迭代轮数。
 
     Returns:
-        v_safe (...,3): projected command (no worse than the current one).
-        fix_norm (...,): total projected-away speed magnitude (stats/diagnostic), >=0.
+        v_safe (...,3): 投影后的指令（不会比当前指令更差）。
+        fix_norm (...,): 被投影掉的合计速度大小（统计/诊断用），>=0。
     """
     v = v_nom.clone()
     fix_norm = torch.zeros(pos.shape[:-1], dtype=v.dtype, device=v.device)
@@ -114,35 +113,35 @@ def filter_velocity(pos, v_nom, p_obs, r_safe, active, alpha, iterations=3):
         _, dist, n = _gradients(pos, p_obs)
         h = dist - r_safe                                        # (...,K)
         g = (n * v.unsqueeze(-2)).sum(-1) + alpha * h            # n.v + alpha h
-        # violation only on active slots (inactive -> +inf so never selected)
+        # 只统计激活槽位上的违例（未激活 -> +inf，永远不会被选中）
         g_act = torch.where(active, g, torch.full_like(g, float("inf")))
-        delta = torch.clamp(-g_act, min=0.0)                     # (...,K) >=0
-        viol = delta.max(dim=-1).values                          # (...,)
+        delta = torch.clamp(-g_act, min=0.0)                     # (...,K) 违例量 >=0
+        viol = delta.max(dim=-1).values                          # (...,) 各样本最大违例
         need = (viol > 0).any()
         if not need:
             break
-        # push back along the outward normal of the MOST-violated constraint only:
-        #   v *= v - (-g) n = v + (n.v + alpha h) n  (closed form, one obstacle)
-        best = (delta == viol.unsqueeze(-1)) & active            # one-hot (...,K)
-        n_sel = (n * best.unsqueeze(-1)).sum(dim=-2)             # (...,3)
+        # 只沿违约最严重约束的外法向方向回推：
+        #   v *= v - (-g) n = v + (n.v + alpha h) n  （单个障碍物的闭式解）
+        best = (delta == viol.unsqueeze(-1)) & active            # one-hot 掩码 (...,K)
+        n_sel = (n * best.unsqueeze(-1)).sum(dim=-2)             # (...,3) 选中的法向量
         v = v + viol.unsqueeze(-1) * n_sel
         fix_norm = fix_norm + viol
     return v, fix_norm
 
 
 def cbf_violation(pos, v_nom, p_obs, r_safe, active, alpha, penalty_intrude=True):
-    """Total pre-filter CBF violation for the reward core (<=0).
+    """供奖励核心使用的滤波前 CBF 总违例量（<=0）。
 
-    sum_i min(0, n_i^T v_nom + alpha h_i)  over active slots; optionally adds an extra
-    min(0, h_i) term per slot that is already inside its CBF ball (h_i < 0), so "being
-    inside" is penalized regardless of the current command direction.
+    对所有激活槽位求和 sum_i min(0, n_i^T v_nom + alpha h_i)；可选地对每个已处于
+    CBF 球内部（h_i < 0）的槽位再额外叠加一项 min(0, h_i)，从而无论当前指令方向
+    如何，都会对"已侵入球内"进行惩罚。
 
-    Returns (...,) <= 0 (more negative = more unsafe).
+    Returns (...,) 取值 <= 0（越小表示越不安全）。
     """
     _, dist, n = _gradients(pos, p_obs)
     h = dist - r_safe                                            # (...,K)
     g = (n * v_nom.unsqueeze(-2)).sum(-1) + alpha * h            # n.v_nom + alpha h
-    viol = torch.clamp(g, max=0.0)                               # (...,K) <=0
+    viol = torch.clamp(g, max=0.0)                               # (...,K) 违例 <=0
     viol = torch.where(active, viol, torch.zeros_like(viol))
     total = viol.sum(dim=-1)
     if penalty_intrude:
@@ -152,20 +151,19 @@ def cbf_violation(pos, v_nom, p_obs, r_safe, active, alpha, penalty_intrude=True
     return total
 
 
-# --------------------------------------------------------------- torchrl Transform
+# --------------------------------------------------------------- torchrl 变换（Transform）
 class CBFVelocityFilter(Transform):
-    """Velocity-domain CBF filter placed BEFORE ``VelController`` in the action chain.
+    """置于动作链中 ``VelController`` 之前的速域 CBF 滤波器。
 
-    Reads the policy's raw 4-dim command (3-vel + yaw), projects the linear part onto
-    the CBF half-spaces and writes the result back to ``action_key`` (yaw untouched).
-    It also records the PRE-filter command into ``("info", "policy_action")`` so the env
-    reward core (reward_only / hybrid) can penalize exactly what the policy produced
-    (CBF-RL soft-CBF). Requires env-frame geometry per env per slot in
-    ``("info", "obstacle_cbf")`` of shape (..., K, 4) = [p_oi(3), r_si^cbf(1)],
-    inactive slots exactly zero.
+    读取策略输出的原始 4 维指令（3 维速度 + yaw），把其中的平动部分投影到 CBF
+    半平面内，并把结果写回 ``action_key``（yaw 保持不变）。同时把滤波前的指令
+    记录到 ``("info", "policy_action")``，使环境奖励核心（reward_only / hybrid）能够
+    恰好惩罚策略的实际输出（CBF-RL soft-CBF）。需要 ``("info", "obstacle_cbf")``
+    提供每个环境、每个槽位的环境坐标系几何信息，形状为 (..., K, 4) =
+    [p_oi(3), r_si^cbf(1)]，未激活槽位必须为全零。
 
-    Placement note: torchrl ``Compose`` runs inv (action) transforms in *reverse* add
-    order, so this transform must be appended AFTER ``VelController`` in the chain list.
+    放置说明：torchrl 的 ``Compose`` 会按 *逆* 添加顺序执行 inv（动作侧）变换，
+    因此本变换必须在动作链表中追加在 ``VelController`` 之后。
     """
 
     def __init__(
@@ -173,8 +171,8 @@ class CBFVelocityFilter(Transform):
         action_key=("agents", "action"),
         alpha=1.0,
         iterations=3,
-        filter_grad="detach",        # detach | through (through keeps graph; unused in env)
-        do_filter=True,              # False -> record v_nom only (reward_only mode)
+        filter_grad="detach",        # detach | through（through 保留计算图；环境中未使用）
+        do_filter=True,              # False -> 只记录 v_nom 不做滤波（reward_only 模式）
     ):
         if not _TORCHRL:
             raise RuntimeError("CBFVelocityFilter requires torchrl")
@@ -187,14 +185,14 @@ class CBFVelocityFilter(Transform):
         self.do_filter = bool(do_filter)
 
     def _inv_call(self, tensordict):
-        drone_state = tensordict[("info", "drone_state")]      # (...,13) pos is [:3]
+        drone_state = tensordict[("info", "drone_state")]      # (...,13) 位置在前 [:3]
         obs_cbf = tensordict[("info", "obstacle_cbf")]         # (...,K,4)
-        action = tensordict[self.action_key]                   # (...,4) raw speed cmd
+        action = tensordict[self.action_key]                   # (...,4) 原始速度指令
 
         pos = drone_state[..., :3]
         p_obs = obs_cbf[..., :3]                               # (...,K,3)
         r_cbf = obs_cbf[..., 3]                                # (...,K)
-        active = r_cbf > 0                                     # radius>0 source of truth
+        active = r_cbf > 0                                     # 以半径>0 作为激活判据
 
         if self.filter_grad == "through":
             v_nom = action[..., :3]
@@ -203,7 +201,7 @@ class CBFVelocityFilter(Transform):
             p_obs = p_obs.detach()
             r_cbf = r_cbf.detach()
 
-        # record the pre-filter command for the reward core (full 4-dim, incl. yaw)
+        # 记录滤波前的指令供奖励核心使用（完整的 4 维，含 yaw）
         tensordict.set(("info", "policy_action"), action.clone())
 
         if self.do_filter and active.any():
@@ -215,12 +213,12 @@ class CBFVelocityFilter(Transform):
         return tensordict
 
 
-# ------------------------------------------------------------------ config plumbing
+# ------------------------------------------------------------------ 配置接线（config plumbing）
 def extract_cbf_params(cfg):
-    """Pull the NavVel ``cbf:`` section + geometry/limits into a flat dict.
+    """把 NavVel 的 ``cbf:`` 配置段 + 几何/限速参数抽取为扁平的字典。
 
-    ``cfg`` is the hydra config object (task defaults mounted under ``cfg.task``).
-    Tolerates a missing section entirely (returns None -> caller disables CBF).
+    ``cfg`` 为 hydra 配置对象（task 默认参数挂在 ``cfg.task`` 下）。
+    完全容忍缺少该配置段的情况（返回 None -> 调用方禁用 CBF）。
     """
     try:
         from omegaconf import OmegaConf
@@ -264,11 +262,11 @@ def extract_cbf_params(cfg):
 
 
 def build_cbf_filter(cfg, action_key=("agents", "action")):
-    """Return a CBFVelocityFilter for the env action chain, or None if not needed.
+    """为环境动作链返回一个 CBFVelocityFilter；若不需要则返回 None。
 
-    filter_only / hybrid -> filter + record v_nom.
-    reward_only           -> record v_nom only (filter off; env applies the reward core).
-    none                  -> None (env behaves exactly like naive).
+    filter_only / hybrid -> 做滤波 + 记录 v_nom。
+    reward_only          -> 只记录 v_nom（不滤波；由环境施加奖励核心）。
+    none                 -> None（环境行为与 naive 完全一致）。
     """
     p = extract_cbf_params(cfg)
     if p is None or p["mode"] == "none":
