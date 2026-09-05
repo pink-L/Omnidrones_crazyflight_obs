@@ -117,6 +117,33 @@ curriculum:
   min_frames_between_promote: 2_000_000   # 距上次升级最少帧数(env 步)防临界抖动
   allow_demote: false
 
+# ===================================================================================
+# [M2-3 2026-09-05] CBF1 safety layer on the velocity-command action (m2_plan §5).
+#   First-order CBF per active obstacle ball (center p_oi, decision radius
+#   r_si^cbf = r_si + r_safety_margin + [v_max^2/(2 a_max)] braking allowance,
+#   r_si = drone_radius + r_oi + inflation = geometric radius used by obs/collision).
+#   Constraint  dot h + alpha h >= 0  (h = ||p-p_oi|| - r_si^cbf, static v_o=0) is a
+#   half-space on the velocity command; filter = iterative closed-form projection.
+#   mode（对照 cbf-rl-demo 的臂; 均需 obstacle on 才有意义）:
+#     none        = 完全 naive（无滤波无 reward core; 与 M2 基线逐位一致）  ← 默认
+#     filter_only = 滤波危险速度（VelController 前投影）, 不改奖励
+#     reward_only = 不滤波, 用「滤波前 v_nom」罚 CBF 违反(reward core, λ=reward_weight)
+#     hybrid      = filter_only + reward_only（CBF-RL 主线 = 模型 B）
+#   违反量 r_cbf = λ·Σ_active min(0, n_iᵀv_nom + αh_i) [+ penalty_intrude 时 h_i<0 追加];
+#   reward core 必须用滤波前 v_nom 算(否则策略学不到被罚的是自己输出)。
+#   ⚠️ CBF 半径只进滤波/奖励, 不进策略 obs（防策略对滤波器内部参数过拟合, 见接口文档 §1）。
+cbf:
+  mode: none            # none | filter_only | reward_only | hybrid
+  alpha: 1.0            # CBF 收敛率 (需调, 0.5~5 起)
+  r_safety_margin: 0.1  # 几何判定半径外的固定安全裕量 (m)
+  use_brake_term: true  # 加制动/内环裕量 v_max²/(2 a_max)（低层是速度指令→Lee, 有滞后）
+  a_max: 2.0            # 制动近似最大加速度 (m/s², 实测/可调)
+  max_vel: null         # null=沿用 vel_limit.max_vel(1.8), 或显式覆盖(制动项用)
+  reward_weight: 0.5    # reward core 权重 λ (从 0.5~1.0 起试, 勿学 kaiwu 大惩罚)
+  penalty_intrude: true # h_i<0(已侵入 CBF 球)时在 reward core 里追加罚 min(0,h_i)
+  filter_grad: detach   # detach | through（env 不反传, 语义开关; 默认 detach 稳定）
+  filter_iterations: 3  # 迭代投影轮数(每轮修最违反的一个约束; 多障碍用)
+
 # ---- domain randomization (optional, keep off for baseline) ----
 # randomization:
 #   drone:

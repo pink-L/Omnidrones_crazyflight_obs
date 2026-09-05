@@ -34,6 +34,7 @@ from omni_drones.utils.torchrl.compat import CompositeSpec, UnboundedContinuousT
 from omni_drones.envs.utils import create_obstacle
 from omni_drones.envs.single.nav_vel_obstacles import ObstacleManager
 from omni_drones.utils.nav_curriculum import ObstacleCurriculum
+from omni_drones.utils.cbf import cbf_violation, safety_radius_extra
 
 
 def _to_plain_dict(obj):
@@ -134,8 +135,39 @@ class NavVel(IsaacEnv):
             self.obstacle_reward_early_death_weight = float(oc.get("reward_early_death_weight", 0.0))
             self.obstacle_early_death_threshold = float(oc.get("early_death_threshold_steps", 300))
             self.obstacle_obs_dist_norm = float(oc.get("obs_dist_norm", 5.0))
+            # [M2-3] CBF1 config (velocity-layer safety layer; see m2_plan.md §5).
+            #   cbf_extra = margin + brake allowance added on top of the geometric r_s.
+            #   mode: none | filter_only | reward_only | hybrid (transform in train/play/
+            #   eval_ckpt; reward core is applied below in _compute_reward_and_done).
+            self._cbf_cfg = _to_plain_dict(cfg.task.get("cbf", None))
+            ccbf = self._cbf_cfg or {}
+            self.cbf_mode = str(ccbf.get("mode", "none"))
+            self.cbf_use_filter = self.cbf_mode in ("filter_only", "hybrid")
+            self.cbf_use_reward_core = self.cbf_mode in ("reward_only", "hybrid")
+            self.cbf_alpha = float(ccbf.get("alpha", 1.0))
+            self.cbf_reward_weight = float(ccbf.get("reward_weight", 0.5))
+            self.cbf_penalty_intrude = bool(ccbf.get("penalty_intrude", True))
+            self.cbf_extra = None
+            if self.cbf_mode != "none":
+                vl = _to_plain_dict(cfg.task.get("vel_limit", None)) or {}
+                v_max = ccbf.get("max_vel", None) or float(vl.get("max_vel", 1.8))
+                self.cbf_extra = safety_radius_extra(
+                    float(oc.get("drone_radius", 0.15)),
+                    float(oc.get("inflation", 0.05)),
+                    float(ccbf.get("r_safety_margin", 0.1)),
+                    float(v_max),
+                    float(ccbf.get("a_max", 2.0)),
+                    bool(ccbf.get("use_brake_term", True)),
+                )
         else:
             self.K = 0
+            self.cbf_mode = "none"
+            self.cbf_use_filter = False
+            self.cbf_use_reward_core = False
+            self.cbf_alpha = 1.0
+            self.cbf_reward_weight = 0.0
+            self.cbf_penalty_intrude = False
+            self.cbf_extra = None
 
         super().__init__(cfg, headless)
 
@@ -316,6 +348,7 @@ class NavVel(IsaacEnv):
             "min_clearance": UnboundedContinuousTensorSpec(1),  # EMA min surface clearance
             "success_rate": UnboundedContinuousTensorSpec(1),  # window success (arr&0 edge)
             "curriculum_level": UnboundedContinuousTensorSpec(1),  # active obstacle count
+            "cbf_violation": UnboundedContinuousTensorSpec(1),  # [M2-3] CBF reward-core violation (>=0)
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["stats"] = stats_spec
         self.stats = stats_spec.zero()
@@ -325,6 +358,9 @@ class NavVel(IsaacEnv):
             "drone_state": UnboundedContinuousTensorSpec((self.drone.n, 13), device=self.device),
             "prev_action": UnboundedContinuousTensorSpec((self.drone.n, 4), device=self.device),
             "policy_action": UnboundedContinuousTensorSpec((self.drone.n, 4), device=self.device),
+            # [M2-3] CBF ball channel for CBFVelocityFilter: (n, K, 4) = [p_oi(3), r_si^cbf(1)]
+            "obstacle_cbf": UnboundedContinuousTensorSpec(
+                (self.drone.n, self.K, 4), device=self.device),
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["info"] = info_spec
         self.info = info_spec.zero()
@@ -485,6 +521,12 @@ class NavVel(IsaacEnv):
             self._obs_dmin = self.obstacles.min_clearance(drone_pos)   # (N,1)
             self.obstacles.update_min_clearance(drone_pos)
             obs.append(self._obs_block)
+            # [M2-3] per-slot CBF ball (center + CBF radius) fed to CBFVelocityFilter
+            # before VelController each step. Inactive slots stay 0 (r_safe=0).
+            if self.cbf_extra is not None:
+                rcbf = self.obstacles.r_safe + self.cbf_extra          # (N,K)
+                self.info["obstacle_cbf"][:] = torch.cat(
+                    [self.obstacles.pos, rcbf.unsqueeze(-1)], dim=-1).unsqueeze(1)
         obs = torch.cat(obs, dim=-1)
 
         return TensorDict(
@@ -600,6 +642,22 @@ class NavVel(IsaacEnv):
                          / self.life_steps.clamp(min=1)).clamp(1.0, 10.0)
                 reward = reward - self.obstacle_reward_early_death_weight \
                     * scale * (new_edge & self.collide_exceed).float()
+
+            # [M2-3] CBF1 reward core + violation stat. Uses the PRE-filter policy command
+            # (v_nom recorded by CBFVelocityFilter into info.policy_action), so the policy
+            # learns that the penalized command is its own output (soft-CBF, CBF-RL).
+            if self.cbf_extra is not None:
+                vnom = self.policy_actions[..., :3]                    # (N,1,3) pre-filter
+                rcbf = self.obstacles.r_safe + self.cbf_extra          # (N,K)
+                act = self.obstacles.r_safe > 0                        # (N,K)
+                viol = cbf_violation(
+                    drone_pos, vnom,
+                    self.obstacles.pos.unsqueeze(1), rcbf.unsqueeze(1),
+                    act.unsqueeze(1),
+                    self.cbf_alpha, self.cbf_penalty_intrude)          # (N,1) <= 0
+                self.stats["cbf_violation"].lerp_(-viol, (1 - self.alpha))
+                if self.cbf_reward_weight > 0 and self.cbf_use_reward_core:
+                    reward = reward - self.cbf_reward_weight * viol
 
         # --- per-life / termination bookkeeping (spatial bounds, env frame) ---
         self.life_steps += 1
