@@ -34,7 +34,11 @@ from omni_drones.utils.torchrl.compat import CompositeSpec, UnboundedContinuousT
 from omni_drones.envs.utils import create_obstacle
 from omni_drones.envs.single.nav_vel_obstacles import ObstacleManager
 from omni_drones.utils.nav_curriculum import ObstacleCurriculum
-from omni_drones.utils.cbf import cbf_violation, safety_radius_extra
+from omni_drones.utils.cbf import (
+    cbf_violation,
+    filter_velocity,
+    safety_radius_extra,
+)
 
 
 def _to_plain_dict(obj):
@@ -152,6 +156,8 @@ class NavVel(IsaacEnv):
             self.cbf_alpha = float(ccbf.get("alpha", 1.0))
             self.cbf_reward_weight = float(ccbf.get("reward_weight", 0.5))
             self.cbf_penalty_intrude = bool(ccbf.get("penalty_intrude", True))
+            self.cbf_penalty_src = str(ccbf.get("penalty_src", "nominal"))
+            self.cbf_iterations = int(ccbf.get("filter_iterations", 3))
             self.cbf_extra = None
             if self.cbf_mode != "none":
                 vl = _to_plain_dict(cfg.task.get("vel_limit", None)) or {}
@@ -172,6 +178,8 @@ class NavVel(IsaacEnv):
             self.cbf_alpha = 1.0
             self.cbf_reward_weight = 0.0
             self.cbf_penalty_intrude = False
+            self.cbf_penalty_src = "nominal"
+            self.cbf_iterations = 3
             self.cbf_extra = None
 
         super().__init__(cfg, headless)
@@ -668,7 +676,25 @@ class NavVel(IsaacEnv):
                 # deliberately aim at obstacles; the filter kept physics safe so collision
                 # stayed ~0 but the "penalty" was actually a bonus).
                 if self.cbf_reward_weight > 0 and self.cbf_use_reward_core:
-                    reward = reward + self.cbf_reward_weight * viol
+                    # [2026-09-05 / M2] penalty_src 选择"罚什么"（只对有滤波的臂有
+                    # 区分意义；默认 nominal 与旧行为逐位一致, 不动任何基线）:
+                    #   nominal    = 罚原始指令 v_nom 的 CBF 违反量 (soft-CBF 原版;
+                    #               hybrid λ0.05 长训后期 arrival 停滞的机制: 保守策略
+                    #               学会"远离被罚区"而非"安全穿过").
+                    #   correction = 罚滤波器"实际纠偏量" ||v_filtered − v_nom||:
+                    #               滤波没拦你(安全通过)就不罚, 拦得越多罚越多 → 逼策略
+                    #               学"让滤波无话可说"的安全近穿, 消除保守绕行偏置。
+                    #   要求 mode=filter_only/hybrid (纠偏来自滤波本身); reward_only
+                    #   (do_filter=False, 无纠偏) 自动回退 nominal。
+                    if self.cbf_penalty_src == "correction" and self.cbf_use_filter:
+                        v_safe, _ = filter_velocity(
+                            drone_pos, vnom,
+                            self.obstacles.pos.unsqueeze(1), rcbf.unsqueeze(1),
+                            act.unsqueeze(1), self.cbf_alpha, self.cbf_iterations)
+                        corr = (v_safe - vnom).norm(dim=-1)  # (N,1) >= 0
+                        reward = reward - self.cbf_reward_weight * corr
+                    else:
+                        reward = reward + self.cbf_reward_weight * viol
 
         # --- per-life / termination bookkeeping (spatial bounds, env frame) ---
         self.life_steps += 1
