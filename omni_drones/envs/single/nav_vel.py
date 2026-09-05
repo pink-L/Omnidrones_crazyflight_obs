@@ -656,8 +656,13 @@ class NavVel(IsaacEnv):
                     act.unsqueeze(1),
                     self.cbf_alpha, self.cbf_penalty_intrude)          # (N,1) <= 0
                 self.stats["cbf_violation"].lerp_(-viol, (1 - self.alpha))
+                # viol <= 0 (more negative = more unsafe): ADD it (weighted) so the unsafe
+                # command is PENALIZED. Do NOT subtract (that would reward violations --
+                # bug found 2026-09-05: return ballooned to ~1e4 while policy learned to
+                # deliberately aim at obstacles; the filter kept physics safe so collision
+                # stayed ~0 but the "penalty" was actually a bonus).
                 if self.cbf_reward_weight > 0 and self.cbf_use_reward_core:
-                    reward = reward - self.cbf_reward_weight * viol
+                    reward = reward + self.cbf_reward_weight * viol
 
         # --- per-life / termination bookkeeping (spatial bounds, env frame) ---
         self.life_steps += 1

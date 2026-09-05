@@ -176,6 +176,16 @@ def t5_violation_reward_core():
     viol_in_off = cbf_violation(pos_in, v_ok, p, rs, act, ALPHA, penalty_intrude=False)
     check("t5 intrude adds h<0 penalty", viol_in.item() < viol_in_off.item() - 1e-4,
           f"with={viol_in.item():.4f} without={viol_in_off.item():.4f}")
+    # reward-core APPLICATION sign (regression for the 2026-09-05 bug where `reward -= w*viol`
+    # turned the penalty into a bonus and return ballooned to ~1e4):
+    #   reward_core = base + w * viol  (viol<=0  =>  safe: unchanged, unsafe: smaller)
+    w = 0.5
+    base = torch.zeros_like(viol_bad)
+    reward_bad = base + w * viol_bad
+    check("t5 reward core PENALIZES unsafe cmd", reward_bad.item() < 0.0,
+          f"reward_core={reward_bad.item():.4f}")
+    check("t5 reward core leaves safe cmd unchanged",
+          (base + w * viol_ok).item() == 0.0)
 
 
 def t6_config_plumbing():
