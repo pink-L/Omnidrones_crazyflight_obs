@@ -81,6 +81,13 @@ def main(cfg):
                 max_yaw_rate=vl.get("max_yaw_rate", None),
             )
             transforms.append(transform)
+            # [M2-3] optional CBF velocity filter. Appended AFTER VelController so Compose
+            # applies it FIRST on the way into the env (inv runs in reverse add order):
+            # policy cmd -> CBF project -> VelController(magnitude/yaw limit) -> Lee.
+            from omni_drones.utils.cbf import build_cbf_filter
+            cbf_filter = build_cbf_filter(cfg)
+            if cbf_filter is not None:
+                transforms.append(cbf_filter)
         elif action_transform == "PIDrate":
             # [SimpleFlight migration 2026-09-04] policy -> CTBR -> rate PID -> motor
             from omni_drones.controllers import PIDRateController as _PIDRateController

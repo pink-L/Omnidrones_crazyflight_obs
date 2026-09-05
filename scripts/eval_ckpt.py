@@ -55,6 +55,12 @@ def main(cfg):
                 max_vel=vl.get("max_vel", None),
                 max_yaw_rate=vl.get("max_yaw_rate", None),
             ))
+            # [M2-3] optional CBF velocity filter (appended AFTER VelController so Compose
+            # applies it FIRST into the env; same as train.py).
+            from omni_drones.utils.cbf import build_cbf_filter
+            cbf_filter = build_cbf_filter(cfg)
+            if cbf_filter is not None:
+                transforms.append(cbf_filter)
         elif action_transform == "PIDrate":
             from omni_drones.controllers import PIDRateController as _PIDRateController
             from omni_drones.utils.torchrl.transforms import PIDRateController
