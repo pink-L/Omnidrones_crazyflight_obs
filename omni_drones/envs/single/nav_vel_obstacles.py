@@ -60,7 +60,12 @@ class ObstacleManager:
     def __init__(self, cfg, num_envs, device="cuda:0"):
         self.device = torch.device(device)
         self.num_envs = int(num_envs)
+        # [M2 2026-09-05 obs-window] obs 窗口槽位 K（=max_slots, obs 维度 4K）与
+        #   场景物理障碍数 M（=num_scene, 缓冲区/prim 数）解耦：M>K 时 build_obs 每步
+        #   取最近的 K 个（滑动窗口）；M<=K（默认, num_scene 未设）保持固定槽旧语义。
         self.K = int(cfg.get("max_slots", 8))
+        self.M = int(max(int(cfg.get("num_scene") or cfg.get("max_slots", 8)), self.K))
+        self.obs_window = bool(cfg.get("obs_window", self.M > self.K))
         self.radius_choices = [float(x) for x in cfg.get("radius_choices", [0.30])]
         self.drone_radius = float(cfg.get("drone_radius", 0.15))
         self.inflation = float(cfg.get("inflation", 0.05))
@@ -86,10 +91,10 @@ class ObstacleManager:
         self.radius_max = max(self.radius_choices)
         self._tiers = torch.tensor(self.radius_choices, dtype=torch.float32, device=self.device)
 
-        # full-batch buffers
-        self.pos = torch.zeros(self.num_envs, self.K, 3, dtype=torch.float32, device=self.device)
-        self.radius = torch.zeros(self.num_envs, self.K, dtype=torch.float32, device=self.device)
-        self.active = torch.zeros(self.num_envs, self.K, dtype=torch.bool, device=self.device)
+        # full-batch buffers (M = 场景障碍数; M>=K)
+        self.pos = torch.zeros(self.num_envs, self.M, 3, dtype=torch.float32, device=self.device)
+        self.radius = torch.zeros(self.num_envs, self.M, dtype=torch.float32, device=self.device)
+        self.active = torch.zeros(self.num_envs, self.M, dtype=torch.bool, device=self.device)
         # per-env episode-level running min clearance (m), for stats/eval
         self.ep_min_clearance = torch.full(
             (self.num_envs, 1), float("inf"), dtype=torch.float32, device=self.device)
@@ -132,16 +137,35 @@ class ObstacleManager:
     def build_obs(self, drone_pos):
         """(N, 1, K*4) normalized obstacle block for the policy.
 
+        固定槽模式（默认, M<=K）: 槽位 = 布局顺序的激活障碍, 未激活槽补零（与 M2 完全兼容）。
+        滑动窗口模式（M>K, obs_window）: 每步从全部激活障碍中取距 drone 最近的 K 个并按
+        距离升序填入 -> 场景可有远多于 K 个障碍而 obs 恒为 8 槽（62 维）。
         Per slot: (rpos_xyz / obs_dist_norm clamped [-1,1], radius / obs_radius_norm
-        clamped [0,1]); inactive slots are exactly zero (mask). Pure geometry radius,
+        clamped [0,1]); invalid slots are exactly zero (mask). Pure geometry radius,
         NOT the CBF radius (kept out of obs on purpose).
         """
-        dvec = self.pos - drone_pos                                   # (N,K,3)
-        block = torch.cat([
-            (dvec / self.obs_dist_norm).clamp(-1.0, 1.0),             # (N,K,3)
-            (self.radius / self.obs_radius_norm).clamp(0.0, 1.0).unsqueeze(-1),
-        ], dim=-1)                                                    # (N,K,4)
-        block = block * self.active.unsqueeze(-1)
+        if self.obs_window:
+            # 选最近 K 个激活障碍（升序）；不足 K 个时剩余槽补零
+            d = torch.norm(self.pos - drone_pos, dim=-1)              # (N,M)
+            d = torch.where(self.active, d, torch.full_like(d, float("inf")))
+            vals, idx = torch.topk(d, k=self.K, dim=-1, largest=False)  # (N,K)
+            valid = torch.isfinite(vals)                              # (N,K)
+            p_sel = self.pos.gather(
+                1, idx.clamp(min=0).unsqueeze(-1).expand(-1, -1, 3))  # (N,K,3)
+            r_sel = self.radius.gather(1, idx.clamp(min=0))           # (N,K)
+            dvec = p_sel - drone_pos                                  # (N,K,3) 障碍相对 drone
+            block = torch.cat([
+                (dvec / self.obs_dist_norm).clamp(-1.0, 1.0),         # (N,K,3)
+                (r_sel / self.obs_radius_norm).clamp(0.0, 1.0).unsqueeze(-1),
+            ], dim=-1)                                                # (N,K,4)
+            block = block * valid.unsqueeze(-1)
+        else:
+            dvec = self.pos - drone_pos                               # (N,M,3), M=K
+            block = torch.cat([
+                (dvec / self.obs_dist_norm).clamp(-1.0, 1.0),         # (N,K,3)
+                (self.radius / self.obs_radius_norm).clamp(0.0, 1.0).unsqueeze(-1),
+            ], dim=-1)                                                # (N,K,4)
+            block = block * self.active.unsqueeze(-1)
         return block.reshape(self.num_envs, 1, self.K * 4)
 
     # ------------------------------------------------------------------- layout
@@ -157,9 +181,9 @@ class ObstacleManager:
         """
         n = init_pos.shape[0]
         if n_active <= 0 or n == 0:
-            return (torch.zeros(n, self.K, 3, device=self.device),
-                    torch.zeros(n, self.K, device=self.device),
-                    torch.zeros(n, self.K, dtype=torch.bool, device=self.device))
+            return (torch.zeros(n, self.M, 3, device=self.device),
+                    torch.zeros(n, self.M, device=self.device),
+                    torch.zeros(n, self.M, dtype=torch.bool, device=self.device))
         L = int(n_active)
         init_pos = init_pos.reshape(n, 1, 3)
         goal_pos = goal_pos.reshape(n, 1, 3)
@@ -180,8 +204,8 @@ class ObstacleManager:
                 sub, init_pos[sub], goal_pos[sub], L, init_clr, goal_clr, gap)
             # merge into full result (active slots are the first L columns)
             if pos is None:
-                pos = torch.zeros(n, self.K, 3, device=self.device)
-                rad = torch.zeros(n, self.K, device=self.device)
+                pos = torch.zeros(n, self.M, 3, device=self.device)
+                rad = torch.zeros(n, self.M, device=self.device)
             pos[sub, :L] = p_s
             rad[sub, :L] = r_s
             new_fail = torch.zeros(n, dtype=torch.bool, device=self.device)
@@ -193,7 +217,7 @@ class ObstacleManager:
             sub = fail_mask.nonzero(as_tuple=False).squeeze(-1)
             pos[sub], rad[sub] = self._fallback_layout(sub, init_pos[sub], goal_pos[sub], L)
 
-        active = torch.arange(self.K, device=self.device).unsqueeze(0).expand(n, -1) < L
+        active = torch.arange(self.M, device=self.device).unsqueeze(0).expand(n, -1) < L
         # inactive radius/pos already zero; enforce zero for safety
         rad = rad * active
         pos = pos * active.unsqueeze(-1)

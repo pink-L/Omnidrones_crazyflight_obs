@@ -123,7 +123,11 @@ class NavVel(IsaacEnv):
         self._has_obstacles = bool(self._obstacle_cfg and self._obstacle_cfg.get("max_slots", 0))
         if self._has_obstacles:
             oc = self._obstacle_cfg
-            self.K = int(oc["max_slots"])
+            self.K = int(oc["max_slots"])          # obs 槽位窗口 K（obs 维度 = 30 + 4K）
+            # [M2 2026-09-05 obs-window] num_scene M = 场景物理障碍数（缓冲区/prim 数）。
+            #   M > K -> obs 每步实时取最近 K 个（滑动窗口, obs 恒 62 维）；M <= K 保持固定槽旧语义。
+            self.M = int(max(int(oc.get("num_scene") or self.K), self.K))
+            self.obs_window = bool(oc.get("obs_window", self.M > self.K))
             self.obstacle_phys_radius = float(max(oc.get("radius_choices", [0.30])))
             self.obstacle_collision_margin = float(oc.get("collision_margin", 0.05))
             self.obstacle_danger_radius = float(oc.get("danger_radius", 0.6))
@@ -186,7 +190,7 @@ class NavVel(IsaacEnv):
             self.obstacle_views = RigidPrimView(
                 "/World/envs/env_*/obstacle_*",
                 reset_xform_properties=False,
-                shape=[self.num_envs, self.K],
+                shape=[self.num_envs, self.M],
             )
             self.obstacle_views.initialize()
             self.obstacles = ObstacleManager(self._obstacle_cfg, self.num_envs, self.device)
@@ -287,7 +291,7 @@ class NavVel(IsaacEnv):
         # is <= physical, thus the geometric decision radius r_s >= physical ball keeps the
         # geometric detection consistent (triggers at/earlier than physical contact).
         if self._has_obstacles:
-            for i in range(self.K):
+            for i in range(self.M):
                 create_obstacle(
                     f"/World/envs/env_0/obstacle_{i}", "Sphere",
                     translation=(0.0, 0.0, -100.0),
@@ -358,9 +362,10 @@ class NavVel(IsaacEnv):
             "drone_state": UnboundedContinuousTensorSpec((self.drone.n, 13), device=self.device),
             "prev_action": UnboundedContinuousTensorSpec((self.drone.n, 4), device=self.device),
             "policy_action": UnboundedContinuousTensorSpec((self.drone.n, 4), device=self.device),
-            # [M2-3] CBF ball channel for CBFVelocityFilter: (n, K, 4) = [p_oi(3), r_si^cbf(1)]
+            # [M2-3] CBF ball channel for CBFVelocityFilter: (n, M, 4) = [p_oi(3), r_si^cbf(1)]
+            #   M = num_scene (>= K)；CBF 必须对全部场景障碍安全（不只看 obs 窗口）。
             "obstacle_cbf": UnboundedContinuousTensorSpec(
-                (self.drone.n, self.K, 4), device=self.device),
+                (self.drone.n, self.M, 4), device=self.device),
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["info"] = info_spec
         self.info = info_spec.zero()
