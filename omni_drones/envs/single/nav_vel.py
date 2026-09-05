@@ -158,6 +158,7 @@ class NavVel(IsaacEnv):
             self.cbf_penalty_intrude = bool(ccbf.get("penalty_intrude", True))
             self.cbf_penalty_src = str(ccbf.get("penalty_src", "nominal"))
             self.cbf_iterations = int(ccbf.get("filter_iterations", 3))
+            self.cbf_correction_sigma = float(ccbf.get("correction_sigma", 0.5))
             self.cbf_extra = None
             if self.cbf_mode != "none":
                 vl = _to_plain_dict(cfg.task.get("vel_limit", None)) or {}
@@ -180,6 +181,7 @@ class NavVel(IsaacEnv):
             self.cbf_penalty_intrude = False
             self.cbf_penalty_src = "nominal"
             self.cbf_iterations = 3
+            self.cbf_correction_sigma = 0.5
             self.cbf_extra = None
 
         super().__init__(cfg, headless)
@@ -684,15 +686,30 @@ class NavVel(IsaacEnv):
                     #   correction = 罚滤波器"实际纠偏量" ||v_filtered − v_nom||:
                     #               滤波没拦你(安全通过)就不罚, 拦得越多罚越多 → 逼策略
                     #               学"让滤波无话可说"的安全近穿, 消除保守绕行偏置。
+                    #   correction = 罚滤波器"实际纠偏量" ||v_filtered − v_nom||:
+                    #               滤波没拦你(安全通过)就不罚, 拦得越多罚越多 → 逼策略
+                    #               学"让滤波无话可说"的安全近穿, 消除保守绕行偏置。
+                    #   gaussian  = correction 的论文式平滑高斯核 (CBF-RL Table II
+                    #               r_cbf 第二项): pen = λ·(1 − exp(−corr²/σ²)) ∈ [0, λ),
+                    #               0 纠偏不罚、小纠偏几乎无感、大纠偏饱和到 λ —— 比线性
+                    #               λ·corr 稳(大纠偏不无限放大), σ 标定"判为显著纠偏"的
+                    #               尺度(默认 0.5 ≈ 0.28·v_max, 见 navvel_rl_interface.md
+                    #               §3.6 启示①)。缓解强 shaping 下"correction 罚大拽回
+                    #               hybrid" 的过罚问题。
                     #   要求 mode=filter_only/hybrid (纠偏来自滤波本身); reward_only
                     #   (do_filter=False, 无纠偏) 自动回退 nominal。
-                    if self.cbf_penalty_src == "correction" and self.cbf_use_filter:
+                    if self.cbf_penalty_src in ("correction", "gaussian") and self.cbf_use_filter:
                         v_safe, _ = filter_velocity(
                             drone_pos, vnom,
                             self.obstacles.pos.unsqueeze(1), rcbf.unsqueeze(1),
                             act.unsqueeze(1), self.cbf_alpha, self.cbf_iterations)
-                        corr = (v_safe - vnom).norm(dim=-1)  # (N,1) >= 0
-                        reward = reward - self.cbf_reward_weight * corr
+                        corr = (v_safe - vnom).norm(dim=-1)          # (N,1) >= 0
+                        if self.cbf_penalty_src == "gaussian":
+                            sig2 = self.cbf_correction_sigma ** 2
+                            pen = self.cbf_reward_weight * (1.0 - torch.exp(-(corr ** 2) / sig2))
+                            reward = reward - pen
+                        else:
+                            reward = reward - self.cbf_reward_weight * corr
                     else:
                         reward = reward + self.cbf_reward_weight * viol
 

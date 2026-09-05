@@ -155,7 +155,12 @@ cbf:
   #                拦得越多罚越多 → 逼策略学"安全近穿"而非"保守绕行"(治 D2-16
   #                hybrid 高 λ 的避罚区偏置)。仅 filter_only/hybrid 有意义;
   #                reward_only(无滤波) 自动回退 nominal。
-  penalty_src: nominal
+  penalty_src: nominal      # nominal | correction | gaussian（reward core 罚什么, 见 navvel_rl_interface.md §3.6/3.7）
+  #   nominal    = 罚原始指令 v_nom 的 CBF 违反量 (原版 soft-CBF; 默认, 基线不动)
+  #   correction = 罚滤波器实际纠偏量 ||v_filtered − v_nom||(线性)
+  #   gaussian   = correction 的论文式平滑高斯核 λ·(1−exp(−corr²/σ²)): 大纠偏饱和不
+  #                无限放大(CBF-RL Table II r_cbf 第二项, 治强 shaping 下过罚拽回 hybrid)
+  correction_sigma: 0.5    # gaussian 的"判为显著纠偏"尺度 σ (m/s, CBF-RL 论文 0.5≈0.28·v_max)
   filter_grad: detach   # detach | through（env 不反传, 语义开关; 默认 detach 稳定）
   filter_iterations: 3  # 迭代投影轮数(每轮修最违反的一个约束; 多障碍用)
 
