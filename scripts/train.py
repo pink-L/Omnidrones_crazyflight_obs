@@ -138,12 +138,14 @@ def main(cfg):
         exploration_type: ExplorationType=ExplorationType.MODE
     ):
 
-        base_env.enable_render(True)
+        render = bool(cfg.get("render_eval", True))  # [2026-09-05] 多臂并行短训避渲染 OOM: render_eval=false
+        if render:
+            base_env.enable_render(True)
         base_env.eval()
         env.eval()
         env.set_seed(seed)
 
-        render_callback = RenderCallback(interval=2)
+        render_callback = RenderCallback(interval=2) if render else None
 
         with set_exploration_type(exploration_type):
             trajs = env.rollout(
@@ -154,7 +156,8 @@ def main(cfg):
                 break_when_any_done=False,
                 return_contiguous=False,
             )
-        base_env.enable_render(not cfg.headless)
+        if render:
+            base_env.enable_render(not cfg.headless)
         env.reset()
 
         done = trajs.get(("next", "done"))
@@ -174,12 +177,13 @@ def main(cfg):
             for k, v in traj_stats.items()
         }
 
-        # log video
-        info["recording"] = wandb.Video(
-            render_callback.get_video_array(axes="t c h w"),
-            fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
-            format="mp4"
-        )
+        # log video (skipped when render_eval=false)
+        if render:
+            info["recording"] = wandb.Video(
+                render_callback.get_video_array(axes="t c h w"),
+                fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
+                format="mp4"
+            )
 
         # log distributions
         # df = pd.DataFrame(traj_stats)
