@@ -95,13 +95,17 @@ class NavVel(IsaacEnv):
         # [NR-1 2026-09-06] reward scheme: legacy(默认=Hover 常驻基座版, 逐位不变) |
         #   navgoal(论文式纯 motion: progress 势差 γ建议1.0; 实证=from-scratch 死锁+warm 无增益,
         #   保留作对照) | r1([New1 2026-09-06] motion-gated 接近引导: 接近势只在朝目标运动时给正,
-        #   悬停=0、远离=0、越近越强 -> 保留稠密引导又无悬停刷分平台; 障碍/CBF dual 项复用)。
-        #   方案文档 drones/new_reward.md / new1_plan.md。navgoal/r1 才附加 first_arrival_step/mean_action_diff stat。
+        #   悬停=0、远离=0、越近越强 -> 保留稠密引导又无悬停刷分平台; 实证 from-scratch 死锁
+        #   (接近势核 k=1.6 远端≈0→远端无引导), 保留作对照) | f1([New1/F1 2026-09-06] 无核飞行主导:
+        #   纯 ① relu(v·u_g)/vmax + 到达, 无距离核远端=近端同强, 治 r1"起飞吸引力不够"; 见 new_reward.md §F1)。
+        #   方案文档 drones/new_reward.md / new1_plan.md。navgoal/r1/f1 才附加 first_arrival_step/mean_action_diff stat。
         self.reward_scheme = str(cfg.task.get("reward_scheme", "legacy"))
-        # [NR-1] 到达"时间 bonus" w_t: +w_t*(1 - t_arr/T), 越快越多; 0=仅 flat base (navgoal/r1)
+        # [NR-1] 到达"时间 bonus" w_t: +w_t*(1 - t_arr/T), 越快越多; 0=仅 flat base (navgoal/r1/f1)
         self.arrive_time_bonus = float(cfg.task.get("arrive_time_bonus", 0.0))
         # [New1/R1] motion-gated 接近引导权重 (r1 主稠密项): w_g * relu(v·u_g)/vmax * 1/(1+(k·d)²)
         self.reward_gate_weight = float(cfg.task.get("reward_gate_weight", 0.0))
+        # [New1/F1] 无核飞行主导权重 (f1 主项): w_f * relu(v·u_g)/vmax; 0=关 (new_reward.md §F1)
+        self.reward_fly_weight = float(cfg.task.get("reward_fly_weight", 0.0))
         vl_cfg = cfg.task.get("vel_limit", None) or {}
         self.max_vel = float(vl_cfg.get("max_vel", 1.8))
 
@@ -381,11 +385,11 @@ class NavVel(IsaacEnv):
             "curriculum_level": UnboundedContinuousTensorSpec(1),  # active obstacle count
             "cbf_violation": UnboundedContinuousTensorSpec(1),  # [M2-3] CBF reward-core violation (>=0)
         }
-        # [NR-1] navgoal-only stats（legacy 保持 stats_spec 逐位不变）:
+        # [NR-1] navgoal/r1/f1-only stats（legacy 保持 stats_spec 逐位不变）:
         #   first_arrival_step = 窗口内首次到达的 progress_buf 步数(0=从未到达, EpisodeStats
         #                        在 done 步采样 -> 反映整窗); mean_action_diff = 策略速度指令
         #                        差分 EMA(验收"动作平滑").
-        if self.reward_scheme in ("navgoal", "r1"):
+        if self.reward_scheme in ("navgoal", "r1", "f1"):
             stats_dict["first_arrival_step"] = UnboundedContinuousTensorSpec(1)
             stats_dict["mean_action_diff"] = UnboundedContinuousTensorSpec(1)
         stats_spec = CompositeSpec(stats_dict).expand(self.num_envs).to(self.device)
@@ -608,7 +612,7 @@ class NavVel(IsaacEnv):
         self.arrival_triggered |= just_arrived
         self.episode_any_arrival |= just_arrived    # whole-episode flag (kept across respawns)
         reward_arrival = self.arrive_bonus * just_arrived.float()
-        if self.reward_scheme in ("navgoal", "r1"):
+        if self.reward_scheme in ("navgoal", "r1", "f1"):
             # [NR-1] time-scaled arrival: 越快越多 (+w_t*(1 - t_arr/T)), T=max_episode_length
             if self.arrive_time_bonus > 0:
                 t_arr = self.progress_buf.to(pos_error.dtype).unsqueeze(-1)      # (N,1)
@@ -652,6 +656,22 @@ class NavVel(IsaacEnv):
                 reward = self.reward_gate_weight * appro * pose + reward_arrival
             else:
                 reward = reward_arrival
+        elif self.reward_scheme == "f1":
+            # [New1/F1] 无核飞行主导 (用户 2026-09-06 反馈"起飞吸引力不够"): r1 失败因接近势核
+            #   1/(1+(k·d)²) 在 spawn 距离 d≈3.6 处把信号压到 ~3% 峰值 -> 远端=无引导。
+            #   f1 去掉距离核 -> ① 纯运动项无衰减(远端=近端同强)且是速度指令直接函数(action-local),
+            #   悬停/远离=0、正朝目标运动每步按 relu(v·u_g)/vmax 给正。
+            #   r = w_f * [relu(v·u_g)/v_max]_≤1 + arrival(time-scaled); 平滑④/⑥⑦随后叠加。
+            #   形状坑同 r1: u_goal 用 rpos.norm(dim=-1,keepdim=True) 除(N,1,1); reduce 无 keepdim
+            #   得 2D (N,1) 与 reward/stats 对齐。
+            if self.reward_fly_weight > 0:
+                u_goal = self.rpos / self.rpos.norm(dim=-1, keepdim=True).clamp_min(1e-6)  # (N,1,3)
+                v_lin = self.drone_state[..., 7:10]                          # (N,1,3) 平动速度
+                fly = torch.relu((v_lin * u_goal).sum(dim=-1))               # (N,1) 朝目标速率(2D)
+                fly = (fly / self.max_vel).clamp(max=1.0)
+                reward = self.reward_fly_weight * fly + reward_arrival
+            else:
+                reward = reward_arrival
         else:
             # [legacy] Hover 常驻版（默认, 逐位不变）
             reward = (
@@ -662,7 +682,7 @@ class NavVel(IsaacEnv):
                 + reward_arrival
                 + reward_pbrs
             )
-        if self.reward_scheme in ("navgoal", "r1"):
+        if self.reward_scheme in ("navgoal", "r1", "f1"):
             # [NR-1/R1] action-layer smoothness（速度指令差分, 负惩罚）:
             #   -w_s*||a_t - a_{t-1}||^2; a = policy_action(滤波前 4D 速度+yaw 指令).
             #   注意 pa/pp 为 3D (N,1,4) -> norm(dim=-1, keepdim=False) 得 2D (N,1)，

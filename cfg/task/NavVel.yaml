@@ -62,9 +62,12 @@ pbrs_gamma: 0.995
 #   legacy = Hover 常驻版（默认，逐位不变）
 #   navgoal = 论文式纯 motion（progress 势差 γ建议 CLI pbrs_gamma=1.0；实证 from-scratch 死锁，保留对照）
 #   r1 = [New1] motion-gated 接近引导：接近势只在"朝目标运动"时给正(悬停=0)，配合
-#        action-diff 平滑 + time-scaled 到达；需 reward_gate_weight>0。
-reward_scheme: legacy            # legacy | navgoal | r1
+#        action-diff 平滑 + time-scaled 到达；需 reward_gate_weight>0。（实证 from-scratch 死锁: 核远端≈0）
+#   f1 = [New1/F1] 无核飞行主导：纯 w_f·relu(v·u_g)/v_max(无距离核, 远端=近端同强) + 到达；
+#        治 r1"起飞吸引力不够"；需 reward_fly_weight>0。
+reward_scheme: legacy            # legacy | navgoal | r1 | f1
 reward_gate_weight: 0.0          # [New1/R1] r1 的 motion-gated 接近引导权重(默认 0 关)
+reward_fly_weight: 0.0           # [New1/F1] f1 的无核飞行主导权重(默认 0 关; 探针 w_f=1.5)
 
 # ---- rewards (inherited Hover-style) ----
 reward_effort_weight: 0.1
