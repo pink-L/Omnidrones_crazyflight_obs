@@ -124,6 +124,17 @@ obstacle:
   # obs 归一化常量
   obs_dist_norm: 5.0            # rpos 分量 /5 截 [-1,1]
   obs_radius_norm: 0.5          # r_o /0.5 截 [0,1]
+  # [New2 2026-09-07] obs 结构级 internalize（new2_plan.md §2）：把 CBF filter 触发边界
+  #   作为显式状态喂给策略（reward-shaping 7+ 组全失败 → 换 obs 结构级手段；机制见 §1.3）。
+  #   none       = 不加（默认, obs 恒 62 维, 与 New1 pg6q5ji5 逐位兼容）
+  #   clearance  = 追加 1 维最小表面净空 min_i(||p-p_oi||-r_si)（纯几何, 保守版）
+  #   cbf_margin = 追加 1 维 CBF 边界余量 h = min_i(||p-p_oi||-r_si^cbf) = dmin - cbf_extra
+  #                (cbf_extra = r_safety_margin[+制动项], 见 cbf 段; 无 CBF/naive 时退化为
+  #                min_clearance)——0 穿越点 = 滤波器介入边界 → 策略学"看到 h 收紧提前减速"
+  #   both       = 两把尺子都加（各 1 维: 几何净空 + CBF 触发边界; 单变量消融再拆开跑）
+  #   ⚠️ obs 维度 62→63/64 → 旧 ckpt 不可 warm 续（同 30→62 先例, 见 §2.2）。
+  obs_safety: none          # none | clearance | cbf_margin | both
+  obs_safety_norm: 0.6      # 通道归一化尺度(m); 0=默认 danger_radius(0.6) 量级
 
 # ---- [M2] curriculum: fixed stages 0->2->4->8 obstacles, success-rate gate --------
 #   所有 env 同 level；level 全局提升；统计在整 episode(600 步窗口)重置时结算。

@@ -37,6 +37,7 @@ from omni_drones.utils.nav_curriculum import ObstacleCurriculum
 from omni_drones.utils.cbf import (
     cbf_violation,
     filter_velocity,
+    safety_obs_channels,
     safety_radius_extra,
 )
 
@@ -162,6 +163,22 @@ class NavVel(IsaacEnv):
             self.obstacle_reward_early_death_weight = float(oc.get("reward_early_death_weight", 0.0))
             self.obstacle_early_death_threshold = float(oc.get("early_death_threshold_steps", 300))
             self.obstacle_obs_dist_norm = float(oc.get("obs_dist_norm", 5.0))
+            # [New2 2026-09-07] obs 结构级 internalize (new2_plan.md §2): 把 CBF filter
+            #   触发边界作为显式状态喂给策略（reward-shaping 已证不可及 → 换 obs 结构手段）。
+            #   none=不加(62 维, 与 New1 pg6q5ji5 逐位兼容); clearance/cbf_margin/both 在
+            #   障碍块后追加 1/1/2 维标量通道(旧 ckpt 因维度变化不可 warm 续, 同 30→62 先例)。
+            self.obs_safety = str(oc.get("obs_safety", "none"))  # none|clearance|cbf_margin|both
+            if self.obs_safety not in ("none", "clearance", "cbf_margin", "both"):
+                raise ValueError(
+                    "task.obstacle.obs_safety must be one of none|clearance|cbf_margin|both, "
+                    f"got {self.obs_safety!r}")
+            # 归一化尺度: 默认 danger_radius(0.6) 量级; 显式 0 -> 沿用 danger_radius
+            self.obs_safety_norm = float(oc.get("obs_safety_norm", 0.0)) \
+                or self.obstacle_danger_radius
+            self.obs_safety_add_clearance = self.obs_safety in ("clearance", "both")
+            self.obs_safety_add_cbf_margin = self.obs_safety in ("cbf_margin", "both")
+            self.obs_safety_dim = int(self.obs_safety_add_clearance) \
+                + int(self.obs_safety_add_cbf_margin)
             # [M2-3] CBF1 config (velocity-layer safety layer; see m2_plan.md §5).
             #   cbf_extra = margin + brake allowance added on top of the geometric r_s.
             #   mode: none | filter_only | reward_only | hybrid (transform in train/play/
@@ -205,6 +222,11 @@ class NavVel(IsaacEnv):
             self.cbf_correction_sigma = 0.5
             self.cbf_correction_weight = 0.0
             self.cbf_extra = None
+            self.obs_safety = "none"
+            self.obs_safety_norm = 0.6
+            self.obs_safety_add_clearance = False
+            self.obs_safety_add_cbf_margin = False
+            self.obs_safety_dim = 0
 
         super().__init__(cfg, headless)
 
@@ -344,6 +366,8 @@ class NavVel(IsaacEnv):
         if self._has_obstacles:
             self.obstacle_obs_dim = 4 * self.K
             observation_dim += self.obstacle_obs_dim
+            # [New2] 安全量通道(CBF 边界余量 h / min_clearance)追加在障碍块后: 62 -> 63/64
+            observation_dim += self.obs_safety_dim
 
         self.observation_spec = CompositeSpec({
             "agents": CompositeSpec({
@@ -573,6 +597,20 @@ class NavVel(IsaacEnv):
             self._obs_dmin = self.obstacles.min_clearance(drone_pos)   # (N,1)
             self.obstacles.update_min_clearance(drone_pos)
             obs.append(self._obs_block)
+            # [New2 2026-09-07] obs 结构级 internalize: CBF 边界余量 h / min_clearance 标量
+            # 通道 (new2_plan.md §2)。h = min_i(||p-p_oi||-r_si^cbf) = dmin - cbf_extra
+            # (cbf_extra 为标量; 无 CBF/naive -> 0, 退化为 min_clearance)。纯几何量训练/部署
+            # 同源、不依赖 filter 在线; cbf_margin 的 0 穿越点 = CBF filter 介入边界 → 策略
+            # 在 obs 层学会"看到 h 收紧就提前减速/绕行"(介入前预测性特征, 治 New1 事后罚稀释)。
+            # 通道须 unsqueeze(1) 成 (N,1,1) 与 cat(dim=-1) 的 3D obs 对齐(标量别保持 (N,1))。
+            if self.obs_safety_dim > 0:
+                obs.extend(safety_obs_channels(
+                    self._obs_dmin,
+                    0.0 if self.cbf_extra is None else float(self.cbf_extra),
+                    self.obs_safety_norm,
+                    self.obs_safety_add_clearance,
+                    self.obs_safety_add_cbf_margin,
+                ))
             # [M2-3] per-slot CBF ball (center + CBF radius) fed to CBFVelocityFilter
             # before VelController each step. Inactive slots stay 0 (r_safe=0).
             if self.cbf_extra is not None:

@@ -76,6 +76,41 @@ def cbf_safety_radius(r_o, drone_radius, inflation, margin, v_max, a_max,
                                      use_brake_term)
 
 
+def safety_obs_channels(dmin, extra, norm, add_clearance, add_cbf_margin):
+    """[New2, 2026-09-07] obs 结构级 internalize：CBF 边界余量 / min_clearance 标量通道。
+
+    new2_plan.md §2：把「CBF filter 触发边界」作为显式状态喂给策略（reward-shaping
+    已证不可及 → obs 结构级改造）。两把"尺子"都是纯几何量（训练/部署同源、sim2real 只需
+    障碍位置可复算、不依赖 filter 在线），故不会像「filter 介入量」那样在撤 filter 部署时
+    产生分布偏移（navvel_rl_interface.md §6 口径变更预告）。
+
+    Args:
+        dmin (N,1): 活动障碍上的最小表面净空 min_i(||p-p_oi||-r_si)
+                    （无活动障碍 = +inf，见 ObstacleManager.min_clearance）。
+        extra (float): CBF 决策半径附加余量 r_si^cbf = r_si + extra（= cbf_extra；
+                      无 CBF / naive(mode=none) 时传 0 → cbf_margin 退化为 min_clearance）。
+        norm (float): 归一化尺度 (m)；默认用 danger_radius(0.6) 量级。
+        add_clearance / add_cbf_margin: 是否输出对应通道（对应 obs_safety:
+                       clearances | cbf_margin | both）。
+
+    Returns: list[(N,1,1)]，按 [clearance?, cbf_margin?] 顺序（可直接 torch.cat 进 obs 尾；
+             obs 拼装为 3D (N,1,f)，标量须 unsqueeze(1) 对齐，见 nav_vel._compute_state_and_obs）。
+
+    通道值 = clamp(d / norm, -1, 1)（both 尺子同一 dmin 的仿射: clearance=dmin,
+             cbf_margin=h=dmin-extra）。无活动障碍 dmin=+inf → 通道 = +1（完全安全）。
+             cbf_margin 的 0 穿越点 = filter 介入边界（h<0 ⇔ 已入 CBF 决策球）。
+             ⚠️ clamp 下限刻意保留「负余量=危险」信息到 -1，不用 relu 剪掉。
+    """
+    d = dmin / float(norm)                             # (N,1)，inf -> clamp 到 +1
+    channels = []
+    if add_clearance:
+        channels.append(d.clamp(-1.0, 1.0).unsqueeze(1))       # (N,1,1)
+    if add_cbf_margin:
+        h = (dmin - float(extra)) / float(norm)
+        channels.append(h.clamp(-1.0, 1.0).unsqueeze(1))       # (N,1,1)
+    return channels
+
+
 # --------------------------------------------------------------- 纯 torch 核函数
 def _gradients(pos, p_obs):
     """计算到一组障碍物的距离、外法向单位向量及相关输入。

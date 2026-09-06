@@ -44,6 +44,7 @@ sys.path.insert(0, "../")
 from omni_drones.utils.cbf import (  # noqa: E402
     cbf_safety_radius,
     safety_radius_extra,
+    safety_obs_channels,
     filter_velocity,
     cbf_violation,
     extract_cbf_params,
@@ -188,6 +189,58 @@ def t5_violation_reward_core():
           (base + w * viol_ok).item() == 0.0)
 
 
+def t7_safety_obs_channels():
+    """[New2] obs 结构级 internalize 安全通道 (new2_plan.md §2) 的归一化数值回归。
+
+    channel = clamp(d / norm, -1, 1), d = dmin (min surface clearance) or
+    h = dmin - cbf_extra (CBF 边界余量, 0 穿越 = filter 介入边界)。
+    """
+    from omni_drones.utils.cbf import safety_obs_channels
+    # no active obstacle: dmin=+inf -> both channels saturate at +1 (fully safe)
+    d = torch.tensor([[float("inf")]], dtype=torch.float32)
+    ch = safety_obs_channels(d, 0.1, 0.6, True, True)
+    check("t7 no-obs -> clearance=+1", ch[0].item() == 1.0, f"v={ch[0].item():.3f}")
+    check("t7 no-obs -> cbf_margin=+1", ch[1].item() == 1.0, f"v={ch[1].item():.3f}")
+    check("t7 channel shapes (N,1,1)", all(c.shape == (1, 1, 1) for c in ch),
+          f"shapes={[tuple(c.shape) for c in ch]}")
+
+    d = torch.tensor([[0.3]], dtype=torch.float32)      # 0.3 m surface clearance
+    # clearance only: single channel, value = 0.3/0.6
+    ch = safety_obs_channels(d, 0.1, 0.6, True, False)
+    check("t7 clearance-only len=1", len(ch) == 1)
+    check("t7 clearance = dmin/norm", abs(ch[0].item() - 0.3 / 0.6) < 1e-6,
+          f"v={ch[0].item():.4f} exp={0.3/0.6:.4f}")
+
+    # cbf_margin only: h = dmin - extra (extra = margin + brake = 0.1+0.81=0.91 in
+    # New1 hybrid/dual; pick dmin=1.2 so h/norm stays un-clamped)
+    d12 = torch.tensor([[1.2]], dtype=torch.float32)
+    extra = MARGIN + V_MAX ** 2 / (2.0 * A_MAX)         # 0.1 + 0.81 = 0.91
+    ch = safety_obs_channels(d12, extra, 0.6, False, True)
+    exp = (1.2 - extra) / 0.6
+    check("t7 cbf_margin = (dmin-extra)/norm", abs(ch[0].item() - exp) < 1e-6,
+          f"v={ch[0].item():.4f} exp={exp:.4f}")
+
+    # both -> 2 channels in [clearance, cbf_margin] order (dmin=0.5 keeps both channels
+    # inside (-1,1): clearance=0.833, cbf_margin=(0.5-0.91)/0.6=-0.683)
+    ch = safety_obs_channels(torch.tensor([[0.5]]), extra, 0.6, True, True)
+    check("t7 both -> 2 channels", len(ch) == 2)
+    check("t7 both order [clearance, cbf_margin]",
+          abs(ch[0].item() - 0.5 / 0.6) < 1e-6 and abs(ch[1].item() - (0.5 - extra) / 0.6) < 1e-6,
+          f"v=[{ch[0].item():.4f},{ch[1].item():.4f}]")
+
+    # clamp keeps "negative margin = danger" info down to -1 (no relu):
+    # far away saturates +1; deep inside CBF/obstacle ball saturates -1
+    ch = safety_obs_channels(torch.tensor([[5.0]]), extra, 0.6, True, True)
+    check("t7 far -> saturate +1", ch[0].item() == 1.0 and ch[1].item() == 1.0)
+    ch = safety_obs_channels(torch.tensor([[-2.0]]), extra, 0.6, True, True)
+    check("t7 deep-inside -> saturate -1", ch[0].item() == -1.0 and ch[1].item() == -1.0)
+    # negative h retained & unclamped: dmin=0.5 < extra=0.91 (crossed filter boundary,
+    # still outside geometric ball) -> h=-0.41, channel=-0.683
+    ch = safety_obs_channels(torch.tensor([[0.5]]), extra, 0.6, False, True)
+    check("t7 crossed filter boundary -> negative h kept",
+          -1.0 < ch[0].item() < 0.0, f"v={ch[0].item():.4f}")
+
+
 def t6_config_plumbing():
     from omegaconf import OmegaConf
     base = OmegaConf.create({
@@ -219,6 +272,7 @@ if __name__ == "__main__":
     t4_multiobstacle_gap()
     t5_violation_reward_core()
     t6_config_plumbing()
+    t7_safety_obs_channels()
     print()
     if _fail:
         print(f"RESULT: {len(_fail)} FAILED -> {_fail}")
