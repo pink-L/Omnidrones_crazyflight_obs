@@ -58,11 +58,13 @@ early_death_threshold_steps: 300  # T_ed
 reward_pbrs_weight: 2.0       # PBRS 目标进度: +w*(d_{t-1} - γ*d_t) (§1.2-3); 0=关
 pbrs_gamma: 0.995
 
-# ---- [NR-1 2026-09-06] reward 方案选择 (方案文档 drones/new_reward.md) ----
-#   legacy = Hover 常驻版（默认，逐位不变）；navgoal = 论文式 motion-based：
-#   删 pose/up/spin/effort 正基座 + progress(γ建议 CLI pbrs_gamma=1.0 纯差分) +
-#   action-diff 平滑(需 CBF filter 在环写 policy_action) + time-scaled 到达。
-reward_scheme: legacy            # legacy | navgoal
+# ---- [NR-1 2026-09-06] reward 方案选择 (方案文档 drones/new_reward.md / new1_plan.md) ----
+#   legacy = Hover 常驻版（默认，逐位不变）
+#   navgoal = 论文式纯 motion（progress 势差 γ建议 CLI pbrs_gamma=1.0；实证 from-scratch 死锁，保留对照）
+#   r1 = [New1] motion-gated 接近引导：接近势只在"朝目标运动"时给正(悬停=0)，配合
+#        action-diff 平滑 + time-scaled 到达；需 reward_gate_weight>0。
+reward_scheme: legacy            # legacy | navgoal | r1
+reward_gate_weight: 0.0          # [New1/R1] r1 的 motion-gated 接近引导权重(默认 0 关)
 
 # ---- rewards (inherited Hover-style) ----
 reward_effort_weight: 0.1
