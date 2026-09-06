@@ -37,6 +37,7 @@ min_init_target_dist: 1.5
 arrive_radius: 0.5
 arrive_hold_steps: 50       # 0.01s * 50 = hold 0.5s inside radius (was 100>avg ep_len)
 arrive_bonus: 10.0          # [guide §1.2-2] 调大测试: 5 -> 10
+arrive_time_bonus: 0.0      # [NR-1] navgoal 到达时间 bonus w_t: +w_t*(1 - t_arr/T); 0=仅 flat base
 success_terminate: false    # keep holding after arrival (learn to stop)
 bound_xy: 5.0
 z_min: 0.15
@@ -56,6 +57,12 @@ reward_early_death_weight: 0.0    # 开局即死额外惩罚 (M2-0: 0=关; M1 �
 early_death_threshold_steps: 300  # T_ed
 reward_pbrs_weight: 2.0       # PBRS 目标进度: +w*(d_{t-1} - γ*d_t) (§1.2-3); 0=关
 pbrs_gamma: 0.995
+
+# ---- [NR-1 2026-09-06] reward 方案选择 (方案文档 drones/new_reward.md) ----
+#   legacy = Hover 常驻版（默认，逐位不变）；navgoal = 论文式 motion-based：
+#   删 pose/up/spin/effort 正基座 + progress(γ建议 CLI pbrs_gamma=1.0 纯差分) +
+#   action-diff 平滑(需 CBF filter 在环写 policy_action) + time-scaled 到达。
+reward_scheme: legacy            # legacy | navgoal
 
 # ---- rewards (inherited Hover-style) ----
 reward_effort_weight: 0.1

@@ -92,6 +92,13 @@ class NavVel(IsaacEnv):
         self.reward_distance_scale = cfg.task.get("reward_distance_scale", 1.6)
         self.time_encoding = cfg.task.get("time_encoding", True)
         self.randomization = cfg.task.get("randomization", {})
+        # [NR-1 2026-09-06] reward scheme: legacy(默认=Hover 常驻基座版, 逐位不变) |
+        #   navgoal(论文式 motion-based: 删 pose/up/spin/effort 正基座; progress 势差 γ建议
+        #   1.0 + action-diff 平滑 + time-scaled 到达 + timeout; 障碍/CBF dual 项复用)。
+        #   方案文档 drones/new_reward.md。仅 navgoal 才附加 first_arrival_step/mean_action_diff stat。
+        self.reward_scheme = str(cfg.task.get("reward_scheme", "legacy"))
+        # [NR-1] navgoal 到达"时间 bonus" w_t: +w_t*(1 - t_arr/T), 越快越多; 0=仅 flat base
+        self.arrive_time_bonus = float(cfg.task.get("arrive_time_bonus", 0.0))
 
         # [M1] waypoint / arrival / termination
         tpr = torch.as_tensor(cfg.task.target_pos_range, dtype=torch.float32)   # (2, 3)
@@ -352,7 +359,7 @@ class NavVel(IsaacEnv):
             state_key=("agents", "intrinsics")
         )
 
-        stats_spec = CompositeSpec({
+        stats_dict = {
             "return": UnboundedContinuousTensorSpec(1),
             "episode_len": UnboundedContinuousTensorSpec(1),
             "pos_error": UnboundedContinuousTensorSpec(1),
@@ -368,7 +375,15 @@ class NavVel(IsaacEnv):
             "success_rate": UnboundedContinuousTensorSpec(1),  # window success (arr&0 edge)
             "curriculum_level": UnboundedContinuousTensorSpec(1),  # active obstacle count
             "cbf_violation": UnboundedContinuousTensorSpec(1),  # [M2-3] CBF reward-core violation (>=0)
-        }).expand(self.num_envs).to(self.device)
+        }
+        # [NR-1] navgoal-only stats（legacy 保持 stats_spec 逐位不变）:
+        #   first_arrival_step = 窗口内首次到达的 progress_buf 步数(0=从未到达, EpisodeStats
+        #                        在 done 步采样 -> 反映整窗); mean_action_diff = 策略速度指令
+        #                        差分 EMA(验收"动作平滑").
+        if self.reward_scheme == "navgoal":
+            stats_dict["first_arrival_step"] = UnboundedContinuousTensorSpec(1)
+            stats_dict["mean_action_diff"] = UnboundedContinuousTensorSpec(1)
+        stats_spec = CompositeSpec(stats_dict).expand(self.num_envs).to(self.device)
         self.observation_spec["stats"] = stats_spec
         self.stats = stats_spec.zero()
 
@@ -519,6 +534,12 @@ class NavVel(IsaacEnv):
         if ("info", "policy_action") in tensordict.keys(True, True):
             self.info["policy_action"] = tensordict[("info", "policy_action")]
         self.prev_actions = self.info["prev_action"].clone()
+        # [NR-1] cache previous policy velocity-cmd for action-layer smoothness.
+        #   info.policy_action 由 CBFVelocityFilter 写 = 滤波前策略 4D 指令 (含 yaw)。
+        #   非 CBF 臂(无滤波)不写 -> policy_action 恒 0 -> adiff≈0, 平滑项自然失效(可接受)。
+        if not hasattr(self, "policy_actions") or self.policy_actions is None:
+            self.policy_actions = self.info["policy_action"].clone()
+        self.prev_policy_actions = self.policy_actions
         self.policy_actions = self.info["policy_action"].clone()
         self.effort = self.drone.apply_action(actions)
 
@@ -582,6 +603,17 @@ class NavVel(IsaacEnv):
         self.arrival_triggered |= just_arrived
         self.episode_any_arrival |= just_arrived    # whole-episode flag (kept across respawns)
         reward_arrival = self.arrive_bonus * just_arrived.float()
+        if self.reward_scheme == "navgoal":
+            # [NR-1] time-scaled arrival: 越快越多 (+w_t*(1 - t_arr/T)), T=max_episode_length
+            if self.arrive_time_bonus > 0:
+                t_arr = self.progress_buf.to(pos_error.dtype).unsqueeze(-1)      # (N,1)
+                frac = (1.0 - t_arr / self.max_episode_length).clamp(min=0.0)
+                reward_arrival = reward_arrival + self.arrive_time_bonus * frac * just_arrived.float()
+            # [NR-1] window first-arrival step (0 = never arrived); 验收"时间短"用.
+            fa = torch.where(just_arrived.bool(),
+                             self.progress_buf.to(pos_error.dtype).unsqueeze(-1),
+                             self.stats["first_arrival_step"])
+            self.stats["first_arrival_step"][:] = fa
 
         # [M1 / guide §1.2-3] PBRS goal-progress (optional, off by default):
         #   w * (d_{t-1} - gamma * d_t), rebased after spawn/respawn inside _respawn/_reset_idx.
@@ -593,14 +625,31 @@ class NavVel(IsaacEnv):
             reward_pbrs = torch.zeros_like(pos_error)
 
         assert reward_pose.shape == reward_up.shape == reward_spin.shape
-        reward = (
-            reward_pose
-            + reward_pose * (reward_up + reward_spin)
-            + reward_effort
-            + reward_action_smoothness
-            + reward_arrival
-            + reward_pbrs
-        )
+        if self.reward_scheme == "navgoal":
+            # [NR-1] motion-based base (论文式): progress 势差(悬停=0; γ 由 CLI pbrs_gamma,
+            #   建议 1.0) + time-scaled arrival。移除 Hover 常驻 pose/up/spin/effort 正基座
+            #   (new_reward.md §3) -> 悬停/绕远不再有"刷分平台"。⑥⑦ 障碍/CBF 项随后叠加。
+            reward = reward_pbrs + reward_arrival
+            # [NR-1] action-layer smoothness（速度指令差分, 负惩罚）:
+            #   -w_s*||a_t - a_{t-1}||^2; a = policy_action(滤波前 4D 速度+yaw 指令).
+            #   注意 pa/pp 为 3D (N,1,4) -> norm(dim=-1, keepdim=False) 得 2D (N,1)，
+            #   与 reward/stats (N,1) 对齐（keepdim=True 会给 (N,1,1) 引发错误广播）。
+            adiff = (self.policy_actions - self.prev_policy_actions).norm(dim=-1)
+            if self.reward_action_smoothness_weight > 0:
+                reward = reward - self.reward_action_smoothness_weight * adiff.square()
+            # mean_action_diff EMA (显式 in-place, 避免 Tensor.lerp_ 的 broadcast 语义)
+            m = self.stats["mean_action_diff"]
+            m[:] = self.alpha * m + (1.0 - self.alpha) * adiff.detach().float()
+        else:
+            # [legacy] Hover 常驻版（默认, 逐位不变）
+            reward = (
+                reward_pose
+                + reward_pose * (reward_up + reward_spin)
+                + reward_effort
+                + reward_action_smoothness
+                + reward_arrival
+                + reward_pbrs
+            )
 
         # [M1 2026-09-04] survival penalty: falling below z_ref (diagnosed free-fall).
         # r -= lambda * max(0, z_ref - z): mild, only bites while the drone is low.
