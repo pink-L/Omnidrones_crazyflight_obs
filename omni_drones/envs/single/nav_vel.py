@@ -106,6 +106,8 @@ class NavVel(IsaacEnv):
         self.reward_gate_weight = float(cfg.task.get("reward_gate_weight", 0.0))
         # [New1/F1] 无核飞行主导权重 (f1 主项): w_f * relu(v·u_g)/vmax; 0=关 (new_reward.md §F1)
         self.reward_fly_weight = float(cfg.task.get("reward_fly_weight", 0.0))
+        # [New1/F1-②] 可选 per-step 时间成本 (仅 f1): 悬停/loiter 持续亏, 治"时间短/完成"; 默认 0=关
+        self.reward_time_cost = float(cfg.task.get("reward_time_cost", 0.0))
         vl_cfg = cfg.task.get("vel_limit", None) or {}
         self.max_vel = float(vl_cfg.get("max_vel", 1.8))
 
@@ -672,6 +674,10 @@ class NavVel(IsaacEnv):
                 reward = self.reward_fly_weight * fly + reward_arrival
             else:
                 reward = reward_arrival
+            # [F1-② 可选] per-step 时间成本(治 loiter/时间短/推完成): r -= c_t 每步;
+            #   默认 0=关(仅 f1 生效, legacy/r1 不受影响)。reward 为 2D (N,1), 减标量广播安全。
+            if self.reward_time_cost > 0:
+                reward = reward - self.reward_time_cost
         else:
             # [legacy] Hover 常驻版（默认, 逐位不变）
             reward = (

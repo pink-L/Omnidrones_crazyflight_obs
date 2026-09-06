@@ -64,10 +64,11 @@ pbrs_gamma: 0.995
 #   r1 = [New1] motion-gated 接近引导：接近势只在"朝目标运动"时给正(悬停=0)，配合
 #        action-diff 平滑 + time-scaled 到达；需 reward_gate_weight>0。（实证 from-scratch 死锁: 核远端≈0）
 #   f1 = [New1/F1] 无核飞行主导：纯 w_f·relu(v·u_g)/v_max(无距离核, 远端=近端同强) + 到达；
-#        治 r1"起飞吸引力不够"；需 reward_fly_weight>0。
+#        治 r1"起飞吸引力不够"；需 reward_fly_weight>0。可选 per-step 时间成本 reward_time_cost。
 reward_scheme: legacy            # legacy | navgoal | r1 | f1
 reward_gate_weight: 0.0          # [New1/R1] r1 的 motion-gated 接近引导权重(默认 0 关)
 reward_fly_weight: 0.0           # [New1/F1] f1 的无核飞行主导权重(默认 0 关; 探针 w_f=1.5)
+reward_time_cost: 0.0            # [New1/F1-②] f1 可选每步时间成本 c_t(默认 0 关; 治 loiter/时间短)
 
 # ---- rewards (inherited Hover-style) ----
 reward_effort_weight: 0.1
