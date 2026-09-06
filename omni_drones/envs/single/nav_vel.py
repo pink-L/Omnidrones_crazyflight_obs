@@ -159,6 +159,9 @@ class NavVel(IsaacEnv):
             self.cbf_penalty_src = str(ccbf.get("penalty_src", "nominal"))
             self.cbf_iterations = int(ccbf.get("filter_iterations", 3))
             self.cbf_correction_sigma = float(ccbf.get("correction_sigma", 0.5))
+            # [M3-A 2026-09-06] dual reward core 的 w2 (gaussian-correction 项权重);
+            #   w1 = reward_weight (nominal-viol 项)。默认 0 → 其余三模式逐位不变。
+            self.cbf_correction_weight = float(ccbf.get("correction_weight", 0.0))
             self.cbf_extra = None
             if self.cbf_mode != "none":
                 vl = _to_plain_dict(cfg.task.get("vel_limit", None)) or {}
@@ -182,6 +185,7 @@ class NavVel(IsaacEnv):
             self.cbf_penalty_src = "nominal"
             self.cbf_iterations = 3
             self.cbf_correction_sigma = 0.5
+            self.cbf_correction_weight = 0.0
             self.cbf_extra = None
 
         super().__init__(cfg, headless)
@@ -678,27 +682,43 @@ class NavVel(IsaacEnv):
                 # deliberately aim at obstacles; the filter kept physics safe so collision
                 # stayed ~0 but the "penalty" was actually a bonus).
                 if self.cbf_reward_weight > 0 and self.cbf_use_reward_core:
-                    # [2026-09-05 / M2] penalty_src 选择"罚什么"（只对有滤波的臂有
-                    # 区分意义；默认 nominal 与旧行为逐位一致, 不动任何基线）:
+                    # [M2 2026-09-05 / M3-A 2026-09-06] penalty_src 选择"罚什么"(只对
+                    # 有滤波的臂有区分意义; 默认 nominal 与旧行为逐位一致, 不动基线):
                     #   nominal    = 罚原始指令 v_nom 的 CBF 违反量 (soft-CBF 原版;
                     #               hybrid λ0.05 长训后期 arrival 停滞的机制: 保守策略
                     #               学会"远离被罚区"而非"安全穿过").
-                    #   correction = 罚滤波器"实际纠偏量" ||v_filtered − v_nom||:
-                    #               滤波没拦你(安全通过)就不罚, 拦得越多罚越多 → 逼策略
-                    #               学"让滤波无话可说"的安全近穿, 消除保守绕行偏置。
-                    #   correction = 罚滤波器"实际纠偏量" ||v_filtered − v_nom||:
+                    #   correction = 罚滤波器"实际纠偏量" ||v_filtered − v_nom||(线性):
                     #               滤波没拦你(安全通过)就不罚, 拦得越多罚越多 → 逼策略
                     #               学"让滤波无话可说"的安全近穿, 消除保守绕行偏置。
                     #   gaussian  = correction 的论文式平滑高斯核 (CBF-RL Table II
                     #               r_cbf 第二项): pen = λ·(1 − exp(−corr²/σ²)) ∈ [0, λ),
                     #               0 纠偏不罚、小纠偏几乎无感、大纠偏饱和到 λ —— 比线性
                     #               λ·corr 稳(大纠偏不无限放大), σ 标定"判为显著纠偏"的
-                    #               尺度(默认 0.5 ≈ 0.28·v_max, 见 navvel_rl_interface.md
-                    #               §3.6 启示①)。缓解强 shaping 下"correction 罚大拽回
-                    #               hybrid" 的过罚问题。
+                    #               尺度(默认 0.5 ≈ 0.28·v_max)。缓解强 shaping 下
+                    #               "correction 罚大拽回 hybrid" 的过罚问题。
+                    #   dual      = [M3-A] CBF-RL 论文式"两项相加" r_cbf (Eq.22+23):
+                    #               w1·viol(v_nom) + w2·(1 − exp(−corr²/σ²)), nominal viol
+                    #               项与 gaussian correction 项同时启用 → 训练中滤波让
+                    #               策略 internalize 安全, 部署可免 runtime filter(Dual 无
+                    #               rt.filter 92.7% vs Filter-only 38.7%, 论文 Table I)。
+                    #               w1 = reward_weight, w2 = correction_weight(默认 0)。
                     #   要求 mode=filter_only/hybrid (纠偏来自滤波本身); reward_only
                     #   (do_filter=False, 无纠偏) 自动回退 nominal。
-                    if self.cbf_penalty_src in ("correction", "gaussian") and self.cbf_use_filter:
+                    if self.cbf_penalty_src == "dual":
+                        # [M3-A] viol 项 w1·viol(任何模式都可用, vnom 即策略输出)
+                        reward = reward + self.cbf_reward_weight * viol
+                        # [M3-A] correction 项 w2·(1−exp(−corr²/σ²)): 需真实滤波才有
+                        # v_safe≠vnom; 无滤波时无纠偏 → dual 退化为仅 w1·viol 项。
+                        if self.cbf_use_filter and self.cbf_correction_weight > 0:
+                            v_safe, _ = filter_velocity(
+                                drone_pos, vnom,
+                                self.obstacles.pos.unsqueeze(1), rcbf.unsqueeze(1),
+                                act.unsqueeze(1), self.cbf_alpha, self.cbf_iterations)
+                            corr = (v_safe - vnom).norm(dim=-1)      # (N,1) >= 0
+                            sig2 = self.cbf_correction_sigma ** 2
+                            pen = self.cbf_correction_weight * (1.0 - torch.exp(-(corr ** 2) / sig2))
+                            reward = reward - pen
+                    elif self.cbf_penalty_src in ("correction", "gaussian") and self.cbf_use_filter:
                         v_safe, _ = filter_velocity(
                             drone_pos, vnom,
                             self.obstacles.pos.unsqueeze(1), rcbf.unsqueeze(1),

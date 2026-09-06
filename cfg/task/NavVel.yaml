@@ -149,18 +149,22 @@ cbf:
   max_vel: null         # null=沿用 vel_limit.max_vel(1.8), 或显式覆盖(制动项用)
   reward_weight: 0.5    # reward core 权重 λ (从 0.5~1.0 起试, 勿学 kaiwu 大惩罚)
   penalty_intrude: true # h_i<0(已侵入 CBF 球)时在 reward core 里追加罚 min(0,h_i)
-  # penalty_src: nominal | correction  —— reward core 罚的对象 (2026-09-05 新开关)
+  # penalty_src: nominal | correction | gaussian | dual —— reward core 罚的对象
   #   nominal    = 罚原始指令 v_nom 的 CBF 违反量 (原版 soft-CBF; 默认, 基线不动)
-  #   correction = 罚滤波器实际纠偏量 ||v_filtered − v_nom||: 滤波没拦就不罚,
+  #   correction = 罚滤波器实际纠偏量 ||v_filtered − v_nom||(线性): 滤波没拦就不罚,
   #                拦得越多罚越多 → 逼策略学"安全近穿"而非"保守绕行"(治 D2-16
-  #                hybrid 高 λ 的避罚区偏置)。仅 filter_only/hybrid 有意义;
-  #                reward_only(无滤波) 自动回退 nominal。
-  penalty_src: nominal      # nominal | correction | gaussian（reward core 罚什么, 见 navvel_rl_interface.md §3.6/3.7）
-  #   nominal    = 罚原始指令 v_nom 的 CBF 违反量 (原版 soft-CBF; 默认, 基线不动)
-  #   correction = 罚滤波器实际纠偏量 ||v_filtered − v_nom||(线性)
+  #                hybrid 高 λ 的避罚区偏置)。
   #   gaussian   = correction 的论文式平滑高斯核 λ·(1−exp(−corr²/σ²)): 大纠偏饱和不
   #                无限放大(CBF-RL Table II r_cbf 第二项, 治强 shaping 下过罚拽回 hybrid)
-  correction_sigma: 0.5    # gaussian 的"判为显著纠偏"尺度 σ (m/s, CBF-RL 论文 0.5≈0.28·v_max)
+  #   dual       = [M3-A 2026-09-06] CBF-RL 论文式"两项相加" r_cbf(Eq.22+23):
+  #                w1·viol(v_nom)[=reward_weight] + w2·(1−exp(−corr²/σ²))[=correction_weight],
+  #                nominal viol 项与 gaussian correction 项同时启用 → 训练中滤波让策略
+  #                internalize 安全, 部署可免 runtime filter(论文 Table I: Dual 无
+  #                rt.filter 92.7% vs Filter-only 38.7%)。
+  #   仅 filter_only/hybrid 有真实纠偏; reward_only(无滤波) 自动回退仅 w1·viol 项。
+  penalty_src: nominal      # nominal | correction | gaussian | dual（见 navvel_rl_interface.md §3.6/3.7）
+  correction_sigma: 0.5     # gaussian/dual correction 项"判为显著纠偏"尺度 σ (CBF-RL 0.5≈0.28·v_max)
+  correction_weight: 0.0    # [M3-A] dual 的 w2(gaussian 项); 默认 0 → 三模式逐位不受影响
   filter_grad: detach   # detach | through（env 不反传, 语义开关; 默认 detach 稳定）
   filter_iterations: 3  # 迭代投影轮数(每轮修最违反的一个约束; 多障碍用)
 
