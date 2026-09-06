@@ -278,3 +278,35 @@ def build_cbf_filter(cfg, action_key=("agents", "action")):
         filter_grad=p["filter_grad"],
         do_filter=(p["mode"] in ("filter_only", "hybrid")),
     )
+
+
+class CmdGaussNoise(Transform):
+    """[M3-B 2026-09-06] 训练侧速度指令高斯噪声（domain randomization）。
+
+    给动作的平动速度分量 (..., :3) 注入零均值高斯噪声（std = sigma m/s），yaw 不动。
+    作用链位置：CBF 投影之后、VelController 之前 —— 滤波器先保证安全，再叠加执行层
+    误差，等价于论文的动力学噪声 d ~ N(0, 20% v_max)（q 更新时位置积分带误差）。
+    reward core 仍罚策略自己的滤波前指令（policy_action），不罚本噪声 → 策略学会
+    “安全指令会被执行误差打偏 → 留裕量”，从而 internalize 对动力学不确定的鲁棒。
+
+    放置：Compose 的 inv（动作侧）按“逆添加序”执行。若想让执行序为
+    CBF filter -> 本噪声 -> VelController，则本变换必须在动作链中追加在
+    VelController 之后、且 cbf_filter 之前（即 add 顺序 VelController, this, CBF）。
+    """
+
+    def __init__(self, action_key=("agents", "action"), sigma=0.0):
+        if not _TORCHRL:
+            raise RuntimeError("CmdGaussNoise requires torchrl")
+        super().__init__([], in_keys_inv=[action_key])
+        self.action_key = action_key
+        self.sigma = float(sigma)
+
+    def _inv_call(self, tensordict):
+        if self.sigma > 0:
+            action = tensordict.get(self.action_key)
+            if action.shape[-1] >= 3:
+                noise = torch.randn_like(action[..., :3]) * self.sigma
+                action = action.clone()
+                action[..., :3] = action[..., :3] + noise
+                tensordict.set(self.action_key, action)
+        return tensordict

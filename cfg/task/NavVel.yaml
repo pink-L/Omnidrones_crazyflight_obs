@@ -168,6 +168,13 @@ cbf:
   filter_grad: detach   # detach | through（env 不反传, 语义开关; 默认 detach 稳定）
   filter_iterations: 3  # 迭代投影轮数(每轮修最违反的一个约束; 多障碍用)
 
+# [M3-B 2026-09-06] 训练侧动力学 DR 噪声（执行层随机化, 对齐论文 q_{k+1}=q_k+(v_k+d)Δt,
+#   d~N(0, 20%·v_max)）。task.dr_noise_sigma 给动作平动速度注入高斯噪声(m/s, std)；
+#   作用在 CBF 投影之后/VelController 之前（安全先保证, 再叠加执行误差 → 策略学留裕量）。
+#   0=关（默认, 与 M2/M3-A 逐位一致）。20%·v_max=0.36（v_max 1.8）；论文亦用 10~30% 档。
+#   ⚠️ 仅 train.py 装配; play/eval_ckpt 不注入(确定性 eval 用 +perturb 测鲁棒)。
+dr_noise_sigma: 0.0
+
 # ---- domain randomization (optional, keep off for baseline) ----
 # randomization:
 #   drone:

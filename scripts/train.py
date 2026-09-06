@@ -84,7 +84,16 @@ def main(cfg):
             # [M2-3] optional CBF velocity filter. Appended AFTER VelController so Compose
             # applies it FIRST on the way into the env (inv runs in reverse add order):
             # policy cmd -> CBF project -> VelController(magnitude/yaw limit) -> Lee.
-            from omni_drones.utils.cbf import build_cbf_filter
+            # [M3-B 2026-09-06] training-side DR: inject Gaussian velocity noise
+            # (`task.dr_noise_sigma`, m/s; 0=off) INSIDE the chain so exec order is
+            # policy -> CBF filter -> DR noise -> VelController (filter guarantees safety
+            # first, then the noisy velocity is tracked by the low-level controller).
+            # The noise transform is added AFTER VelController but BEFORE cbf_filter so
+            # the reverse-add inv order places it between the CBF filter and VelController.
+            from omni_drones.utils.cbf import build_cbf_filter, CmdGaussNoise
+            dr_sigma = float(cfg.task.get("dr_noise_sigma", 0.0))
+            if dr_sigma > 0:
+                transforms.append(CmdGaussNoise(sigma=dr_sigma))
             cbf_filter = build_cbf_filter(cfg)
             if cbf_filter is not None:
                 transforms.append(cbf_filter)
