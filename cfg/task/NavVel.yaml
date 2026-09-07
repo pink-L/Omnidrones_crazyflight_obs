@@ -32,10 +32,12 @@ time_encoding: true
 
 # ---- [M1] waypoint navigation ----
 # [Arena1 2026-09-07] 改版: 全区域布障 + 固定起终点 + 总高 3m (见 drones/arena1_plan.md)。
-#   固定穿越任务: start = (-2.5, 0, 0.5) -> goal = (2.5, 0, 1.5) (6×6 场地中心原点, 右手系)。
+#   固定穿越任务: start -> goal (6×6 场地中心原点, 右手系)。
 #   fixed_init/fixed_target 非空时 env 用常量(随机模式仍在 init_pos_range/target_pos_range
 #   采样并做 min_init_target_dist 重采, 保留作兜底)。
-fixed_init: [-2.5, 0.0, 0.5]
+#   ⚠️ start z 实证定 1.0 (2026-09-07): 用户初定 0.5, 但 0.5 近地在现 sim/Crazyflie 下
+#   from-scratch 学不动(0 障碍也到不了; z=1.0 同条件 3M arrival 12%) -> 用户拍板抬高到 1.0。
+fixed_init: [-2.5, 0.0, 1.0]
 fixed_target: [2.5, 0.0, 1.5]
 target_pos_range: [[-3.0, -3.0, 1.5], [3.0, 3.0, 3.0]]   # (env frame) [low, high] (随机模式兜底)
 init_pos_range:   [[-3.0, -3.0, 1.0], [3.0, 3.0, 2.5]]
