@@ -30,8 +30,14 @@ vel_limit:
 
 time_encoding: true
 
-# ---- [M1] random waypoint navigation ----
-target_pos_range: [[-3.0, -3.0, 1.5], [3.0, 3.0, 3.0]]   # (env frame) [low, high]
+# ---- [M1] waypoint navigation ----
+# [Arena1 2026-09-07] 改版: 全区域布障 + 固定起终点 + 总高 3m (见 drones/arena1_plan.md)。
+#   固定穿越任务: start = (-2.5, 0, 0.5) -> goal = (2.5, 0, 1.5) (6×6 场地中心原点, 右手系)。
+#   fixed_init/fixed_target 非空时 env 用常量(随机模式仍在 init_pos_range/target_pos_range
+#   采样并做 min_init_target_dist 重采, 保留作兜底)。
+fixed_init: [-2.5, 0.0, 0.5]
+fixed_target: [2.5, 0.0, 1.5]
+target_pos_range: [[-3.0, -3.0, 1.5], [3.0, 3.0, 3.0]]   # (env frame) [low, high] (随机模式兜底)
 init_pos_range:   [[-3.0, -3.0, 1.0], [3.0, 3.0, 2.5]]
 min_init_target_dist: 1.5
 arrive_radius: 0.5
@@ -39,9 +45,9 @@ arrive_hold_steps: 50       # 0.01s * 50 = hold 0.5s inside radius (was 100>avg 
 arrive_bonus: 10.0          # [guide §1.2-2] 调大测试: 5 -> 10
 arrive_time_bonus: 0.0      # [NR-1] navgoal 到达时间 bonus w_t: +w_t*(1 - t_arr/T); 0=仅 flat base
 success_terminate: false    # keep holding after arrival (learn to stop)
-bound_xy: 5.0
+bound_xy: 5.0              # OOB 圆形判定半径(m, 不变; 6×6 场地在 [-3,3]² 内不触发)
 z_min: 0.15
-z_max: 4.5
+z_max: 3.0                 # [Arena1] 环境总高 3 m (越界上限 4.5 -> 3.0)
 
 # [M1 2026-09-04 / guide §1.2+§6] stage-0 convergence fixes
 # [M2-0 2026-09-04] ⚠️ 默认惩罚 bake-in 为 0 = M1 已验证配方 fixctl-B (run 9eb3e923,
@@ -99,11 +105,13 @@ obstacle:
   #     障碍按距离升序填入（滑动窗口）。布局/碰撞/奖励/CBF 几何对 M 全部生效, CBF 不只看窗口。
   #   ⚠️ curriculum.levels 最大值须 <= M；改 M 需同步 num_envs 显存/物理预算。
   #   D2 增密示例:  num_scene: 16 + curriculum.levels [0,8,16] (initial_level=2) + 可选缩场。
-  num_scene: null               # null=max_slots(固定槽); >max_slots 启用滑动窗口
+  num_scene: 16               # [Arena1] M=16 场景球缓冲(滑动窗口取最近 K=8 -> obs 恒 62); max level<=M
   obs_window: null              # null=auto(M>K 即开); 可显式强制
   radius_choices: [0.20, 0.30, 0.40]   # 每障碍从多档随机取半径(用户确认 2026-09-04)
-  spawn_xy_range: [[-2.8, -2.8], [2.8, 2.8]]   # 球心采样范围(env 帧, 给 bound_xy=5 留边)
-  spawn_z_range: [0.6, 3.4]                 # z 采样(保证球完整在场内)
+  # [Arena1] 全区域布障: 球心铺满 6×6 (xy ±3, 贴边 ±2.98); 总高 3m -> 球心 z∈[0.6,2.4]
+  #   (下界≥物理球 0.4+余量防穿地; 上界=2.4 -> 球顶≤2.8 < 3.0 留越顶/飞行余量)。
+  spawn_xy_range: [[-3.0, -3.0], [3.0, 3.0]]   # 球心采样范围(env 帧, 覆盖全 6×6)
+  spawn_z_range: [0.6, 2.4]                 # z 采样(总高 3m 重设; 旧 [0.6,3.4] 超出新总高)
   drone_radius: 0.15            # Crazyflie 安全包络半径(m)
   inflation: 0.05               # 障碍膨胀 -> 判定半径 r_s = drone_radius + r_o + inflation
   collision_margin: 0.05        # d_min < 该值 = 碰撞(几何)
@@ -136,13 +144,15 @@ obstacle:
   obs_safety: none          # none | clearance | cbf_margin | both
   obs_safety_norm: 0.6      # 通道归一化尺度(m); 0=默认 danger_radius(0.6) 量级
 
-# ---- [M2] curriculum: fixed stages 0->2->4->8 obstacles, success-rate gate --------
+# ---- [M2] curriculum: fixed stages, success-rate gate (Arena1: 固定穿越, 密度按走廊/体积重定) ----
 #   所有 env 同 level；level 全局提升；统计在整 episode(600 步窗口)重置时结算。
 #   成功定义 = 本窗口至少到达一次(episode_any_arrival) 且 全窗口碰撞边沿==0。
+#   [Arena1 2026-09-07] 6×6 全区域 + 固定起终点 -> 2 起步、最大 16 (体积≈旧 ±2.2 场的 ~1.2×),
+#   中插 12 软化 8->16 跳变(固定路线更难绕)。M=16。
 curriculum:
   enabled: true                 # false -> 锁在 initial_level(锁级训练/评估用)
-  levels: [0, 2, 4, 8]          # level index -> 激活障碍数
-  initial_level: 0              # 0=无障碍(M1 基线); 1=2 障; 2=4 障; 3=8 障
+  levels: [2, 4, 8, 12, 16]     # level index -> 激活障碍数 (from-scratch 从 2 障起)
+  initial_level: 0              # 0=2 障; ...; 4=16 障
   gate_window_episodes: 3000    # 滚动窗口(episode 数)统计 success/collision rate
   success_rate_threshold: 0.80  # success_rate >= 该值才可升级
   collision_rate_threshold: 0.05 # 窗口碰撞率 <= 该值(与 success 同查, 防穿障冲到 80%)

@@ -298,6 +298,15 @@ class NavVel(IsaacEnv):
 
         self.init_pos_dist = D.Uniform(ipr[0].to(self.device), ipr[1].to(self.device))
         self.target_pos_dist = D.Uniform(tpr[0].to(self.device), tpr[1].to(self.device))
+        # [Arena1 2026-09-07] 固定起终点(可选): fixed_init/fixed_target 非 None 时 init/target
+        #   退化为常量(随机 yaw 保留), 任务 = 固定穿越障碍场. 布局净空/重生逻辑不变(见
+        #   _sample_init_pos/_sample_target_pos). cfg.task.fixed_init / fixed_target。
+        _fi = cfg.task.get("fixed_init", None)
+        _ft = cfg.task.get("fixed_target", None)
+        self.fixed_init = (torch.as_tensor(_fi, dtype=torch.float32, device=self.device)
+                           if _fi is not None else None)
+        self.fixed_target = (torch.as_tensor(_ft, dtype=torch.float32, device=self.device)
+                             if _ft is not None else None)
         # small initial tilt + random yaw
         self.init_rpy_dist = D.Uniform(
             torch.tensor([-0.1, -0.1, 0.0], device=self.device) * torch.pi,
@@ -309,7 +318,7 @@ class NavVel(IsaacEnv):
         )
 
         # per-env target (env frame)
-        self.target_pos = self.target_pos_dist.sample((self.num_envs, 1)).to(self.device)
+        self.target_pos = self._sample_target_pos(self.num_envs)
         self.target_heading = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self.alpha = 0.8
 
@@ -324,6 +333,19 @@ class NavVel(IsaacEnv):
         # [SimpleFlight migration 2026-09-04]: buffers consumed by controller Transforms
         self.prev_actions = torch.zeros(self.num_envs, 1, 4, device=self.device)
         self.policy_actions = torch.zeros(self.num_envs, 1, 4, device=self.device)
+
+    # [Arena1 2026-09-07] 起/终点采样: fixed_* 非 None -> 常量(全部 env 同点); 否则随机 Uniform.
+    def _sample_init_pos(self, n):
+        """(n,1,3) init poses: fixed_init 常量 或 随机 Uniform."""
+        if self.fixed_init is not None:
+            return self.fixed_init.reshape(1, 1, 3).expand(n, 1, 3).clone()
+        return self.init_pos_dist.sample((n, 1))
+
+    def _sample_target_pos(self, n):
+        """(n,1,3) targets: fixed_target 常量 或 随机 Uniform."""
+        if self.fixed_target is not None:
+            return self.fixed_target.reshape(1, 1, 3).expand(n, 1, 3).clone()
+        return self.target_pos_dist.sample((n, 1))
 
     def _design_scene(self):
         import omni_drones.utils.kit as kit_utils
@@ -481,8 +503,8 @@ class NavVel(IsaacEnv):
         self.drone._reset_idx(env_ids, self.training)
 
         n = len(env_ids)
-        # --- random initial pose (env frame) ---
-        pos = self.init_pos_dist.sample((n, 1)).to(self.device)
+        # --- initial pose (env frame; fixed_init -> 常量, Arena1) ---
+        pos = self._sample_init_pos(n)
         rpy = self.init_rpy_dist.sample((n, 1)).to(self.device)
         rot = euler_to_quaternion(rpy)
         self.drone.set_world_poses(
@@ -490,15 +512,16 @@ class NavVel(IsaacEnv):
         )
         self.drone.set_velocities(self.init_vels[env_ids], env_ids)
 
-        # --- random target waypoint (env frame), re-sample if too close to init ---
-        target = self.target_pos_dist.sample((n, 1)).to(self.device)
-        for _ in range(3):
-            d = torch.norm(target - pos, dim=-1, keepdim=True)          # (n,1,1)
-            too_close = d < self.min_init_target_dist
-            if not too_close.any():
-                break
-            resample = self.target_pos_dist.sample((n, 1)).to(self.device)
-            target = torch.where(too_close, resample, target)
+        # --- target waypoint (env frame); fixed_target -> 常量; 仅随机模式做太近重采 ---
+        target = self._sample_target_pos(n)
+        if self.fixed_init is None and self.fixed_target is None:
+            for _ in range(3):
+                d = torch.norm(target - pos, dim=-1, keepdim=True)      # (n,1,1)
+                too_close = d < self.min_init_target_dist
+                if not too_close.any():
+                    break
+                resample = self._sample_target_pos(n)
+                target = torch.where(too_close, resample, target)
 
         self.target_pos[env_ids] = target
 
@@ -554,7 +577,7 @@ class NavVel(IsaacEnv):
         # same ordering as _reset_idx: reset the drone/articulation view FIRST so the
         # physics buffers are consistent before we teleport mid-episode.
         self.drone._reset_idx(env_ids, self.training)
-        pos = self.init_pos_dist.sample((n, 1)).to(self.device)
+        pos = self._sample_init_pos(n)
         # [M2] obstacles of this window are static: rejection-sample the respawn pose so
         # a fresh life never starts inside/next to an obstacle (layout itself is kept).
         if self._has_obstacles and self.obstacles is not None:
@@ -568,7 +591,7 @@ class NavVel(IsaacEnv):
                 bidx = bad.nonzero().squeeze(-1)
                 if bidx.numel() == 0:
                     break
-                pos[bidx] = self.init_pos_dist.sample((bidx.numel(), 1)).to(self.device)
+                pos[bidx] = self._sample_init_pos(bidx.numel())
         rpy = self.init_rpy_dist.sample((n, 1)).to(self.device)
         rot = euler_to_quaternion(rpy)
         poses = pos + self.envs_positions[env_ids].unsqueeze(1)
