@@ -202,6 +202,10 @@ cbf:
   #   给策略"保持 h>=0(不进 filter 决策区)"的直接梯度, 配合 obs_safety=cbf_margin 通道
   #   治 filter 兜底下通道无梯度压力。默认 0=关(逐位不变)。
   h_penalty_weight: 0.0     # [E1] 0=关; 需与 obs_safety=cbf_margin 同用(见 §6 E1)
+  # [New2/E1-v2 2026-09-07] 边界罚提前量 buffer (new2_plan.md §6 E1-v2): 罚 = w_h*relu(buffer-h)。
+  #   buffer=0 = E1 原版(只罚 h<0 = 已进 filter 决策区, fire 少); buffer>0 提前在接近边界前
+  #   罚(软墙位置 dmin < cbf_extra+buffer, 类 CBF 版 near_slowdown)。E1-v2 建议 buffer 0.1-0.2。
+  h_penalty_buffer: 0.0     # [E1-v2] 罚提前量(m); 默认 0 = E1 原版逐位兼容
   filter_grad: detach   # detach | through（env 不反传, 语义开关; 默认 detach 稳定）
   filter_iterations: 3  # 迭代投影轮数(每轮修最违反的一个约束; 多障碍用)
 

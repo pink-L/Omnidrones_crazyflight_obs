@@ -37,6 +37,7 @@ from omni_drones.utils.nav_curriculum import ObstacleCurriculum
 from omni_drones.utils.cbf import (
     cbf_violation,
     filter_velocity,
+    h_boundary_penalty,
     safety_obs_channels,
     safety_radius_extra,
 )
@@ -200,6 +201,9 @@ class NavVel(IsaacEnv):
             # [New2/E1 2026-09-07] CBF 边界余量罚权重 w_h(见 reward core): 罚 w_h*relu(-h),
             #   h=dmin-cbf_extra(0 穿越=filter 介入边界) → 守边界梯度; 默认 0=关(逐位不变)。
             self.cbf_h_penalty_weight = float(ccbf.get("h_penalty_weight", 0.0))
+            # [New2/E1-v2] 罚提前量 buffer: 罚 = w_h*relu(buffer - h) → buffer>0 时在接近
+            #   filter 边界前就开始罚(E1 只罚 h<0, fire 少; buffer 给提前梯度)。默认 0 = E1 原版。
+            self.cbf_h_penalty_buffer = float(ccbf.get("h_penalty_buffer", 0.0))
             self.cbf_extra = None
             if self.cbf_mode != "none":
                 vl = _to_plain_dict(cfg.task.get("vel_limit", None)) or {}
@@ -226,6 +230,7 @@ class NavVel(IsaacEnv):
             self.cbf_correction_weight = 0.0
             self.cbf_extra = None
             self.cbf_h_penalty_weight = 0.0
+            self.cbf_h_penalty_buffer = 0.0
             self.obs_safety = "none"
             self.obs_safety_norm = 0.6
             self.obs_safety_add_clearance = False
@@ -890,14 +895,16 @@ class NavVel(IsaacEnv):
                         reward = reward + self.cbf_reward_weight * viol
 
                 # [New2/E1 2026-09-07] CBF 边界余量罚(独立于 penalty_src, 任何有 CBF 的模式可用):
-                #   h = dmin - cbf_extra(0 穿越点 = filter 介入边界)。罚 w_h * relu(-h) → 策略有
-                #   梯度动机保持 h>=0(不进 filter 决策区), 配合 obs_safety=cbf_margin 通道给"守边界"
-                #   直接信号(治 filter 兜底下通道无梯度压力的机制; new2_plan.md §6 E1)。
-                #   dmin 为几何表面净空(obstacle 块上方已算; 无活动障碍=inf → relu(-inf)=0 无罚)。
+                #   h = dmin - cbf_extra(0 穿越点 = filter 介入边界)。罚 w_h*relu(buffer-h) → 策略
+                #   保持 h>=buffer 的梯度。buffer=0 即 E1 原版 relu(-h)(只罚已进 filter 决策区, fire
+                #   少); buffer>0 = E1-v2 提前在接近边界前罚(类 CBF 版 near_slowdown/soft wall)。
+                #   配合 obs_safety=cbf_margin 通道给"守边界"直接信号(new2_plan.md §6 E1/E1-v2)。
+                #   dmin 为几何表面净空(obstacle 块上方已算; 无活动障碍=inf → 罚=0)。
                 #   默认 w_h=0 = 逐位不变。
                 if self.cbf_h_penalty_weight > 0:
-                    h_margin = dmin - float(self.cbf_extra)          # (N,1) CBF 边界余量
-                    reward = reward - self.cbf_h_penalty_weight * torch.relu(-h_margin)
+                    reward = reward - h_boundary_penalty(
+                        dmin, float(self.cbf_extra),
+                        self.cbf_h_penalty_buffer, self.cbf_h_penalty_weight)
 
         # --- per-life / termination bookkeeping (spatial bounds, env frame) ---
         self.life_steps += 1

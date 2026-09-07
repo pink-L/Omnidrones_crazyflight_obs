@@ -45,6 +45,7 @@ from omni_drones.utils.cbf import (  # noqa: E402
     cbf_safety_radius,
     safety_radius_extra,
     safety_obs_channels,
+    h_boundary_penalty,
     filter_velocity,
     cbf_violation,
     extract_cbf_params,
@@ -241,6 +242,36 @@ def t7_safety_obs_channels():
           -1.0 < ch[0].item() < 0.0, f"v={ch[0].item():.4f}")
 
 
+def t8_h_boundary_penalty():
+    """[New2/E1-v2] CBF 边界余量罚 (nav_vel reward core) 数值回归。
+
+    pen = w * relu(buffer - h), h = dmin - extra (extra = brake-off cbf_extra = 0.1)。
+    buffer=0 → E1 原版 relu(-h); buffer>0 提前 fire(软墙 dmin < extra+buffer)。
+    """
+    from omni_drones.utils.cbf import h_boundary_penalty
+    extra = 0.1
+    # buffer=0: E1 原版; far (dmin>extra) -> 0
+    p0 = h_boundary_penalty(torch.tensor([[0.5]]), extra, 0.0, 40.0)
+    check("t8 buffer0 far -> 0", p0.item() == 0.0, f"p={p0.item():.4f}")
+    # buffer=0: inside filter zone (dmin<extra) fires w*(extra-dmin)
+    p_in = h_boundary_penalty(torch.tensor([[0.05]]), extra, 0.0, 40.0)
+    check("t8 buffer0 inside fires", abs(p_in.item() - 40.0 * (0.1 - 0.05)) < 1e-6,
+          f"p={p_in.item():.4f} exp={40.0*0.05:.4f}")
+    # buffer=0.1: fires BEFORE crossing (soft wall at dmin<0.2)
+    pb = h_boundary_penalty(torch.tensor([[0.15]]), extra, 0.1, 40.0)  # h=0.05<0.1
+    check("t8 buffer>0 fires early", abs(pb.item() - 40.0 * (0.1 - (0.15 - 0.1))) < 1e-6,
+          f"p={pb.item():.4f} exp={40.0*0.05:.4f}")
+    # buffer edge exactly h=buffer -> 0 (no fire)
+    pz = h_boundary_penalty(torch.tensor([[0.2]]), extra, 0.1, 40.0)   # h=0.1=buffer
+    check("t8 buffer edge -> 0", pz.item() == 0.0, f"p={pz.item():.4f}")
+    # deeper inside scales up: dmin=0 (h=-0.1) with buffer 0.1 -> w*0.2
+    pd = h_boundary_penalty(torch.tensor([[0.0]]), extra, 0.1, 40.0)
+    check("t8 deeper -> bigger", abs(pd.item() - 40.0 * 0.2) < 1e-6, f"p={pd.item():.4f}")
+    # no active obstacle (dmin=inf) -> 0 regardless of buffer
+    pinf = h_boundary_penalty(torch.tensor([[float("inf")]]), extra, 0.1, 40.0)
+    check("t8 no-obs inf -> 0", pinf.item() == 0.0)
+
+
 def t6_config_plumbing():
     from omegaconf import OmegaConf
     base = OmegaConf.create({
@@ -273,6 +304,7 @@ if __name__ == "__main__":
     t5_violation_reward_core()
     t6_config_plumbing()
     t7_safety_obs_channels()
+    t8_h_boundary_penalty()
     print()
     if _fail:
         print(f"RESULT: {len(_fail)} FAILED -> {_fail}")

@@ -111,6 +111,21 @@ def safety_obs_channels(dmin, extra, norm, add_clearance, add_cbf_margin):
     return channels
 
 
+def h_boundary_penalty(dmin, extra, buffer, weight):
+    """[New2/E1-v2, 2026-09-07] CBF 边界余量罚（CPU 可测，nav_vel reward core 调用）。
+
+    h = dmin - extra（CBF 边界余量, 0 穿越点 = filter 介入边界; extra=cbf_extra）。
+    pen = weight * relu(buffer - h) = weight * relu(buffer + extra - dmin)
+      - buffer=0 → pen = weight * relu(-h)（[E1] 原版: 只在 h<0 = 已进 filter 决策区才罚;
+        fire 少且 filter 兜底几乎不让 h 深负 → 梯度稀）。
+      - buffer>0 → 在接近 filter 边界前 buffer 就开始罚（类 CBF 版 near_slowdown/soft wall,
+        提前给"守边界"梯度, 治 E1 罚不着的机制）。软墙位置 = dmin < extra + buffer。
+    无活动障碍 dmin=inf → h=inf → relu(...)=0（无罚）。返回与 dmin 同形状 tensor。
+    """
+    h = dmin - float(extra)
+    return float(weight) * torch.relu(float(buffer) - h)
+
+
 # --------------------------------------------------------------- 纯 torch 核函数
 def _gradients(pos, p_obs):
     """计算到一组障碍物的距离、外法向单位向量及相关输入。
