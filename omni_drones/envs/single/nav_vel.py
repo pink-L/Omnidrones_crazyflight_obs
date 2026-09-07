@@ -137,6 +137,14 @@ class NavVel(IsaacEnv):
         self.reward_crash_penalty = cfg.task.get("reward_crash_penalty", 0.0)
         self.reward_early_death_weight = cfg.task.get("reward_early_death_weight", 0.0)
         self.early_death_threshold_steps = cfg.task.get("early_death_threshold_steps", 300)
+        # [Arena1-B 2026-09-07] 每次 soft-respawn(坠地 crash/出界 oob/碰撞超限) 一次性惩罚:
+        #   治"多命蒙到到达"。训练 soft_respawn=true 多命下, 策略可撞了重生反复试, 600 步窗内
+        #   曾到达(episode_any_arrival)即可把窗口 success_rate 抬到 ~0.7, 但严格单命验收
+        #   (soft_respawn=false, 一次飞行失败即失败) 一次都飞不过去(arrival<1%)。
+        #   给"每丢一条命"扣一次罚 -> 失误(撞/坠/出界)有即时成本, 逼策略学"单次无失误穿越"
+        #   而非依赖复活。默认 0=关(逐位兼容)。⚠️ 量级勿大(>~15 易致 return 大幅震荡, M1
+        #   早死反比惩罚 return≈-110 的前车之鉴); 建议 2~10 起步。
+        self.reward_respawn_penalty = float(cfg.task.get("reward_respawn_penalty", 0.0))
         self.reward_pbrs_weight = cfg.task.get("reward_pbrs_weight", 0.0)
         self.pbrs_gamma = cfg.task.get("pbrs_gamma", 0.995)
 
@@ -976,6 +984,11 @@ class NavVel(IsaacEnv):
             terminated = torch.zeros_like(misbehave)
             # keep masks 1-D for the boolean op to avoid (N,N) broadcast
             respawn = ((misbehave | collide_death).squeeze(-1) & ~truncated.squeeze(-1))
+            # [Arena1-B 2026-09-07] 每次 soft-respawn 一次性惩罚(丢一条命 -> 扣一次):
+            #   挂在 respawn 判定之后、_respawn 之前, 只作用于本步真正要重生的 env。
+            #   reward 为 2D (N,1), respawn 为 1D (N,) -> unsqueeze 广播。默认 0=关。
+            if self.reward_respawn_penalty > 0:
+                reward = reward - self.reward_respawn_penalty * respawn.unsqueeze(-1).float()
             ids = respawn.nonzero().squeeze(-1)
             if ids.numel() > 0:
                 self._respawn(ids)

@@ -63,6 +63,10 @@ reward_oob_penalty: 0.0       # 飞出边界一次性惩罚 (M2-0: 0=关)
 reward_timeout_penalty: 0.0   # 600 步内从未到达 -> 一次性惩罚 (M2-0: 0=关)
 reward_early_death_weight: 0.0    # 开局即死额外惩罚 (M2-0: 0=关; M1 证与多命冲突)
 early_death_threshold_steps: 300  # T_ed
+# [Arena1-B 2026-09-07] 每次 soft-respawn(坠地/出界/碰撞超限) 一次性惩罚:
+#   治"多命蒙到到达"(多命窗口 success~0.7 vs 严格单命 arrival<1%) -> 逼单次无失误穿越。
+#   默认 0=关(逐位兼容); 建议 2~10 起步(勿大, M1 早死反比 return≈-110 前车之鉴)。
+reward_respawn_penalty: 0.0
 reward_pbrs_weight: 2.0       # PBRS 目标进度: +w*(d_{t-1} - γ*d_t) (§1.2-3); 0=关
 pbrs_gamma: 0.995
 
