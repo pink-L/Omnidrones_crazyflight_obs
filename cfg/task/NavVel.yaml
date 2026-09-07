@@ -148,6 +148,14 @@ curriculum:
   collision_rate_threshold: 0.05 # 窗口碰撞率 <= 该值(与 success 同查, 防穿障冲到 80%)
   min_frames_between_promote: 2_000_000   # 距上次升级最少帧数(env 步)防临界抖动
   allow_demote: false
+  # [New2/E3 2026-09-07] margin gate (new2_plan.md §6 E3): 提升除了 success/collision
+  #   门槛外, 还要求窗口滚动 margin_ok_rate >= margin_frac; margin_ok = 整窗几何表面净空
+  #   min(ep_min_clearance) >= margin_clearance(默认 0.1 ≈ brake-off cbf_extra) → 等价
+  #   h>=0 = 从未进入 CBF filter 介入区 = internalize 语义。→ 策略必须守边界, 密度才升,
+  #   需配 obs_safety=cbf_margin; 门槛更严 → 建议加长 total_frames。默认全关(逐位兼容)。
+  margin_gate: false        # [E3] true 才启用 (需 update 传 margin_ok, nav_vel 自动处理)
+  margin_frac: 0.5          # 窗口内 margin_ok 比例门槛(1.0=每窗都必须守边界, 严; 0.5 折中)
+  margin_clearance: 0.1     # margin_ok 判定的表面净空阈值(m; 0.1≈brake-off cbf_extra)
 
 # ===================================================================================
 # [M2-3 2026-09-05] CBF1 safety layer on the velocity-command action (m2_plan §5).
@@ -189,6 +197,11 @@ cbf:
   penalty_src: nominal      # nominal | correction | gaussian | dual（见 navvel_rl_interface.md §3.6/3.7）
   correction_sigma: 0.5     # gaussian/dual correction 项"判为显著纠偏"尺度 σ (CBF-RL 0.5≈0.28·v_max)
   correction_weight: 0.0    # [M3-A] dual 的 w2(gaussian 项); 默认 0 → 三模式逐位不受影响
+  # [New2/E1 2026-09-07] CBF 边界余量罚权重 w_h (new2_plan.md §6 E1): 罚 w_h*relu(-h),
+  #   h = dmin - cbf_extra(0 穿越点 = filter 介入边界, brake-off 时 extra=0.1)。
+  #   给策略"保持 h>=0(不进 filter 决策区)"的直接梯度, 配合 obs_safety=cbf_margin 通道
+  #   治 filter 兜底下通道无梯度压力。默认 0=关(逐位不变)。
+  h_penalty_weight: 0.0     # [E1] 0=关; 需与 obs_safety=cbf_margin 同用(见 §6 E1)
   filter_grad: detach   # detach | through（env 不反传, 语义开关; 默认 detach 稳定）
   filter_iterations: 3  # 迭代投影轮数(每轮修最违反的一个约束; 多障碍用)
 

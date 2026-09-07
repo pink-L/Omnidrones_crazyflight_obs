@@ -197,6 +197,9 @@ class NavVel(IsaacEnv):
             # [M3-A 2026-09-06] dual reward core 的 w2 (gaussian-correction 项权重);
             #   w1 = reward_weight (nominal-viol 项)。默认 0 → 其余三模式逐位不变。
             self.cbf_correction_weight = float(ccbf.get("correction_weight", 0.0))
+            # [New2/E1 2026-09-07] CBF 边界余量罚权重 w_h(见 reward core): 罚 w_h*relu(-h),
+            #   h=dmin-cbf_extra(0 穿越=filter 介入边界) → 守边界梯度; 默认 0=关(逐位不变)。
+            self.cbf_h_penalty_weight = float(ccbf.get("h_penalty_weight", 0.0))
             self.cbf_extra = None
             if self.cbf_mode != "none":
                 vl = _to_plain_dict(cfg.task.get("vel_limit", None)) or {}
@@ -222,6 +225,7 @@ class NavVel(IsaacEnv):
             self.cbf_correction_sigma = 0.5
             self.cbf_correction_weight = 0.0
             self.cbf_extra = None
+            self.cbf_h_penalty_weight = 0.0
             self.obs_safety = "none"
             self.obs_safety_norm = 0.6
             self.obs_safety_add_clearance = False
@@ -251,6 +255,12 @@ class NavVel(IsaacEnv):
             self.obstacles = ObstacleManager(self._obstacle_cfg, self.num_envs, self.device)
 
             cc = self._curriculum_cfg or {}
+            # [New2/E3] margin gate: 提升还需窗口滚动 margin_ok_rate >= margin_frac
+            #   (margin_ok = 整窗表面净空 >= margin_clearance, 默认 0.1 ≈ brake-off cbf_extra
+            #   → 等价 h>=0 = 从未进 CBF filter 介入区 = internalize 语义)。默认关。
+            self.curriculum_margin_gate = bool(cc.get("margin_gate", False))
+            self.curriculum_margin_frac = float(cc.get("margin_frac", 0.5))
+            self.curriculum_margin_clearance = float(cc.get("margin_clearance", 0.1))
             self.curriculum = ObstacleCurriculum(
                 levels=cc.get("levels", [0, 2, 4, 8]),
                 initial_level=int(cc.get("initial_level", 0)),
@@ -259,6 +269,8 @@ class NavVel(IsaacEnv):
                 collision_threshold=float(cc.get("collision_rate_threshold", 0.05)),
                 min_frames=float(cc.get("min_frames_between_promote", 2_000_000)),
                 allow_demote=bool(cc.get("allow_demote", False)),
+                margin_gate=self.curriculum_margin_gate,
+                margin_frac=self.curriculum_margin_frac,
                 device=self.device,
             )
             self.curriculum_enabled = bool(cc.get("enabled", True))
@@ -448,8 +460,16 @@ class NavVel(IsaacEnv):
                 edges = self.ep_collision_edges[ids].squeeze(-1)
                 success = arrived & (edges == 0)
                 collided = edges > 0
+                # [New2/E3] margin gate: margin_ok = 整窗几何表面净空 min >= margin_clearance
+                #   (ep_min_clearance 仍是本窗结算值; commit_layout 在下方才重置为 inf)。
+                #   无活动障碍(inf)视为 OK。cbf_extra=None(naive) 时默认仍用几何净空门槛。
+                margin_ok = None
+                if self.curriculum_margin_gate:
+                    mc = self.obstacles.ep_min_clearance[ids].squeeze(-1)   # (n,)
+                    margin_ok = (mc >= self.curriculum_margin_clearance) \
+                        | (~torch.isfinite(mc))
                 self.curriculum.update(
-                    success, collided,
+                    success, collided, margin_ok=margin_ok,
                     add_frames=float(ran.sum().item()) * float(self.max_episode_length))
                 self.level_idx = self.curriculum.level_idx
 
@@ -868,6 +888,16 @@ class NavVel(IsaacEnv):
                             reward = reward - self.cbf_reward_weight * corr
                     else:
                         reward = reward + self.cbf_reward_weight * viol
+
+                # [New2/E1 2026-09-07] CBF 边界余量罚(独立于 penalty_src, 任何有 CBF 的模式可用):
+                #   h = dmin - cbf_extra(0 穿越点 = filter 介入边界)。罚 w_h * relu(-h) → 策略有
+                #   梯度动机保持 h>=0(不进 filter 决策区), 配合 obs_safety=cbf_margin 通道给"守边界"
+                #   直接信号(治 filter 兜底下通道无梯度压力的机制; new2_plan.md §6 E1)。
+                #   dmin 为几何表面净空(obstacle 块上方已算; 无活动障碍=inf → relu(-inf)=0 无罚)。
+                #   默认 w_h=0 = 逐位不变。
+                if self.cbf_h_penalty_weight > 0:
+                    h_margin = dmin - float(self.cbf_extra)          # (N,1) CBF 边界余量
+                    reward = reward - self.cbf_h_penalty_weight * torch.relu(-h_margin)
 
         # --- per-life / termination bookkeeping (spatial bounds, env frame) ---
         self.life_steps += 1

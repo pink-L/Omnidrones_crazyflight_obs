@@ -193,14 +193,15 @@ def main():
     print(f"[collision] deterministic pass-through: r_s={r_s:.2f}, edges={edge_hits} (OK)")
 
     # ---------------- curriculum ----------------
-    def make_cur(initial_level=0):
+    def make_cur(initial_level=0, margin_gate=False, margin_frac=0.5):
         return ObstacleCurriculum(
             levels=CUR_CFG["levels"], initial_level=initial_level,
             gate_window=int(CUR_CFG["gate_window_episodes"]),
             success_threshold=float(CUR_CFG["success_rate_threshold"]),
             collision_threshold=float(CUR_CFG["collision_rate_threshold"]),
             min_frames=float(CUR_CFG["min_frames_between_promote"]),
-            allow_demote=False, device=DEVICE)
+            allow_demote=False, device=DEVICE,
+            margin_gate=margin_gate, margin_frac=margin_frac)
 
     cur = make_cur()
     assert cur.level == 0
@@ -223,6 +224,29 @@ def main():
         cur2.update(ok & ~col, col, add_frames=600 * 1024)
     assert cur2.level == 0, "promoted despite collision_rate > threshold"
     print("[curriculum] collision gate blocks promotion OK")
+
+    # [New2/E3] margin gate: even with high success + low collision, low margin_ok
+    # (window kept surface clearance >= margin_clearance) blocks promotion.
+    def feed(cur, ok_p, col_p, marg_p, iters=4):
+        for _ in range(iters):
+            ok = torch.rand(1024, device=DEVICE) < ok_p
+            col = torch.rand(1024, device=DEVICE) < col_p
+            marg = torch.rand(1024, device=DEVICE) < marg_p
+            cur.update(ok & ~col, col, margin_ok=marg, add_frames=600 * 1024)
+
+    cur3 = make_cur(margin_gate=True, margin_frac=0.5)
+    feed(cur3, 0.9, 0.02, 0.30)          # margin_ok_rate ~0.3 < 0.5 -> block
+    assert cur3.level == 0, "promoted despite margin_ok_rate < margin_frac"
+    print("[curriculum] margin gate blocks promotion when margin_ok low OK")
+    cur4 = make_cur(margin_gate=True, margin_frac=0.3)
+    feed(cur4, 0.9, 0.02, 0.60)          # margin_ok_rate ~0.6 >= 0.3 -> promote
+    assert cur4.level == 2, f"expected promote with margin_ok>=frac, got {cur4.level}"
+    print("[curriculum] margin gate promotes when margin_ok>=frac OK")
+    # margin_gate=False (default) is unaffected: legacy callers pass no margin_ok.
+    cur5 = make_cur()
+    feed(cur5, 0.9, 0.02, 0.0, iters=4)  # margin_ok ignored when gate off
+    assert cur5.level == 2, f"default (no margin gate) still promotes, got {cur5.level}"
+    print("[curriculum] default (margin gate off) unaffected OK")
 
     print("\n========== SUMMARY ==========")
     if all_ok:
