@@ -2,6 +2,33 @@
 # Usage (from OmniDrones/scripts):
 #   python eval_ckpt.py task=HoverCrazyflie algo=ppo headless=true wandb.mode=disabled \
 #       +checkpoint=/path/to/checkpoint_XXXX.pt rollout_steps=400
+#
+# ===================== 标准验收模板（默认严格单命口径, 2026-09-07） =====================
+# 目标: 一次飞行 = 一次考核（坠毁/出界/碰撞超限 ⇒ 该 env 判 terminated 且不复活）。
+# NavVel 训练用 soft_respawn=true（软重生给多条命），但验收评估必须覆盖为 false 才是
+# 「一次飞行失败即失败」的严格口径；窗口+多命会稀释失败、数字偏乐观。环境侧与训练同构，
+# 只需配置覆盖、无需改代码（配合下方 auto_reset=False = 单命 600 步窗口）。
+#
+#   python eval_ckpt.py task=NavVel algo=ppo headless=true wandb.mode=disabled \
+#       task.soft_respawn=false          # ← 验收默认：严格单命（必须显式给, 否则=多命乐观口径）
+#       task.reward_scheme=f1 task.reward_fly_weight=6.0 \
+#       task.arrive_bonus=30 task.arrive_time_bonus=30 task.reward_timeout_penalty=40 \
+#       task.reward_action_smoothness_weight=0.2 \
+#       task.obstacle.num_scene=16 'task.obstacle.spawn_xy_range=[[-2.2,-2.2],[2.2,2.2]]' \
+#       'task.curriculum.levels=[16]' task.curriculum.enabled=false \
+#       task.obstacle.reward_collision_edge=4 task.obstacle.reward_near_slowdown_weight=1.0 \
+#       task.cbf.mode=hybrid task.cbf.use_brake_term=false task.cbf.penalty_src=dual \
+#       task.cbf.reward_weight=0.1 task.cbf.correction_weight=0.1 task.cbf.correction_sigma=0.5 \
+#       +checkpoint=<ckpt> +rollout_steps=600 +runtime_filter=true      # ON（带 CBF filter 部署）
+#   # OFF（internalize/撤 filter 判据）换成 +runtime_filter=false；8obs 密度换 num_scene=8
+#   # + levels=[8]。obs_safety 键须与训练一致（无则不加）。
+#
+# 指标口径（eval_ckpt 直接读 env 内部计数器, 单窗口 600 步无 reset）:
+#   arr    = 窗口内曾 ‖rpos‖<arrive_radius(0.5m) 连续保持 ≥arrive_hold_steps(50步) 的 env 比例
+#   coll   = 窗口内曾发生几何接触边沿(new_edge=dmin<collision_margin(0.05) 的进入瞬间)的 env 比例
+#   joint  = arr ∧ 整窗 0 碰撞边沿 的 env 比例（同课程 success 定义）
+# 注: 训练配置里 reward 键（arrive_bonus 等）不影响判定, 仅为保持 obs/几何与训练同构而带上。
+# ==============================================================================
 import logging
 import hydra
 import torch
@@ -61,6 +88,16 @@ def main(cfg):
     OmegaConf.register_new_resolver("eval", eval)
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
+    # [2026-09-07] 打印 eval 口径(日志自解释): 严格单命 vs 窗口多命 + runtime filter。
+    #   验收默认 = 严格单命(task.soft_respawn=false); 若为 true 是训练同构的 soft-respawn
+    #   窗口口径(多命, 稀释失败, 数字偏乐观), 结果应标注口径再比较。
+    _sr = bool(cfg.task.get("soft_respawn", True))
+    _rf = bool(cfg.get("runtime_filter", True))
+    print("[eval_ckpt] semantics: soft_respawn={} -> {}"
+          .format(_sr, "STRICT single-life (acceptance default, keep task.soft_respawn=false)"
+                  if not _sr else "window multi-life (soft-respawn, optimistic)"))
+    print(f"[eval_ckpt] runtime_filter={_rf} -> "
+          + ("CBF velocity filter ON (deploy)" if _rf else "CBF filter DISABLED (internalize check)"))
     simulation_app = init_simulation_app(cfg)
 
     from omni_drones.envs.isaac_env import IsaacEnv
