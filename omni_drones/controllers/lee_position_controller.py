@@ -114,6 +114,32 @@ class LeePositionController(ControllerBase):
         )
         self.requires_grad_(False)
 
+        # [B1 2026-09-09] optional per-(env,agent) dynamic overrides installed by the env
+        #   right after each reset randomizes the physics (NavVel controller_sync_dr).
+        #   This mirrors a real Crazyflie low-level controller whose firmware self-calibrates
+        #   to the TRUE mass / thrust curve instead of a nominal one. None = nominal
+        #   (original behavior, bit-for-bit compatible).
+        #   Shapes (N = num_envs*n, i.e. the flat batch _compute sees after compute()'s
+        #   reshape(-1, ...)): mass -> (N, 1); max_thrusts -> (N, num_rotors).
+        self._mass_dyn = None
+        self._max_thrusts_dyn = None
+
+    def sync_randomized(self, mass=None, kf=None):
+        """[B1 2026-09-09] make this nominal Lee controller track per-env randomized
+        dynamics. Call right after drone._reset_idx() randomized masses/KF.
+        mass: real per-(env,agent) mass -> gravity/thrust compensation (main DR fix).
+        kf:   real per-env rotor force constant = physical thrust at throttle^2=1, i.e.
+              the true per-rotor max thrust -> updates the cmd normalization bound.
+        """
+        if mass is not None:
+            m = mass.detach().reshape(-1, 1)
+            self._mass_dyn = m.to(self.mass.device)
+        if kf is not None:
+            nrot = self.max_thrusts.numel()
+            k = kf.detach().reshape(-1, nrot)
+            self._max_thrusts_dyn = k.to(self.max_thrusts.device)
+        return self
+
     def compute(
         self,
         root_state: torch.Tensor,
@@ -198,10 +224,13 @@ class LeePositionController(ControllerBase):
             - ang_rate_err * self.ang_rate_gain
             + torch.linalg.cross(ang_vel, ang_vel)
         )
-        thrust = (-self.mass * (acc * R[:, :, 2]).sum(-1, True))
+        # [B1 2026-09-09] use per-env real mass / max-thrust if synced, else nominal.
+        mass = self._mass_dyn if self._mass_dyn is not None else self.mass
+        max_thrusts = self._max_thrusts_dyn if self._max_thrusts_dyn is not None else self.max_thrusts
+        thrust = (-mass * (acc * R[:, :, 2]).sum(-1, True))
         ang_acc_thrust = torch.cat([ang_acc, thrust], dim=-1)
         cmd = (self.mixer @ ang_acc_thrust.T).T
-        cmd = (cmd / self.max_thrusts) * 2 - 1
+        cmd = (cmd / max_thrusts) * 2 - 1
         return cmd
 
     def process_rl_actions(self, actions) -> Tensor:

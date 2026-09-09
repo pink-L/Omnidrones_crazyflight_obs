@@ -232,6 +232,13 @@ cbf:
 #   ⚠️ 仅 train.py 装配; play/eval_ckpt 不注入(确定性 eval 用 +perturb 测鲁棒)。
 dr_noise_sigma: 0.0
 
+# [B1 2026-09-09] 低层控制器动力学同步(对照实验, 默认关):
+#   true 时 env 每次 reset(randomize) 后把随机化后的真实 per-env mass/KF 同步给
+#   action_transform=velocity 挂载的低层 Lee controller(模拟真机固件自标定)。
+#   仅仿真对照用 —— 判定 DR 掉点是"低层标称错配(sim artifact)"还是"策略不鲁棒"。
+#   false=标称低层(与之前逐位一致)。eval: +task.controller_sync_dr=true。
+controller_sync_dr: false
+
 # ---- domain randomization (optional, keep off for baseline) ----
 # randomization:
 #   drone:

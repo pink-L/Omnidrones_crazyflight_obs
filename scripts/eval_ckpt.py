@@ -123,6 +123,10 @@ def main(cfg):
             from omni_drones.controllers import LeePositionController
             from omni_drones.utils.torchrl.transforms import VelController
             controller = LeePositionController(9.81, base_env.drone.params).to(base_env.device)
+            # [B1 2026-09-09] mount the low-level controller on the env so a reset with
+            #   task.controller_sync_dr=true re-syncs it to the per-env randomized mass/KF.
+            #   No effect unless controller_sync_dr is on (env sync is gated on the flag).
+            base_env.low_level_controller = controller
             vl = cfg.task.get("vel_limit", {})
             transforms.append(VelController(
                 controller,

@@ -251,6 +251,17 @@ class NavVel(IsaacEnv):
         if "drone" in self.randomization:
             self.drone.setup_randomization(self.randomization["drone"])
 
+        # [B1 2026-09-09] controller_sync_dr: when the action_transform=velocity script
+        #   mounts its low-level Lee controller here (base_env.low_level_controller), each
+        #   reset re-syncs it to the per-env RANDOMIZED real mass/KF after drone._reset_idx.
+        #   This mimics a real Crazyflie low-level controller that self-calibrates to its
+        #   true params; used as a B1 control to test whether the geo7 DR drop is caused by
+        #   the nominal-controller mismatch (sim artifact) rather than policy fragility.
+        #   Default off -> nominal low-level controller (identical to pre-B1 behavior).
+        self.controller_sync_dr = bool(cfg.task.get("controller_sync_dr", False))
+        self.low_level_controller = None
+        self._b1_synced = False
+
         self.target_vis = ArticulationView(
             "/World/envs/env_*/target",
             reset_xform_properties=False
@@ -509,6 +520,7 @@ class NavVel(IsaacEnv):
                 self.level_idx = self.curriculum.level_idx
 
         self.drone._reset_idx(env_ids, self.training)
+        self._sync_low_level_controller()
 
         n = len(env_ids)
         # --- initial pose (env frame; fixed_init -> 常量, Arena1) ---
@@ -585,6 +597,7 @@ class NavVel(IsaacEnv):
         # same ordering as _reset_idx: reset the drone/articulation view FIRST so the
         # physics buffers are consistent before we teleport mid-episode.
         self.drone._reset_idx(env_ids, self.training)
+        self._sync_low_level_controller()
         pos = self._sample_init_pos(n)
         # [M2] obstacles of this window are static: rejection-sample the respawn pose so
         # a fresh life never starts inside/next to an obstacle (layout itself is kept).
@@ -616,6 +629,32 @@ class NavVel(IsaacEnv):
         if self._has_obstacles:
             self.life_collision_edges[env_ids] = 0
             self.prev_in_collision[env_ids] = False
+
+    def _sync_low_level_controller(self):
+        """[B1 2026-09-09] push the drone's current per-env RANDOMIZED dynamics into the
+        low-level controller that the velocity action-transform uses. Called right after
+        drone._reset_idx() (episode reset and mid-episode respawn), so the low-level
+        controller acts like a real Crazyflie firmware that self-calibrates to its true
+        mass/thrust. No-op unless the script mounted a controller AND controller_sync_dr
+        is on (default off -> exactly the pre-B1 nominal-controller behavior).
+        """
+        if not self.controller_sync_dr or self.low_level_controller is None:
+            return
+        ctl = self.low_level_controller
+        if not hasattr(ctl, "sync_randomized"):
+            return
+        n_rot = self.drone.num_rotors
+        mass = self.drone.masses.reshape(-1, 1)        # (N, 1)
+        kf = self.drone.KF.reshape(-1, n_rot)          # (N, num_rotors)
+        ctl.sync_randomized(mass=mass, kf=kf)
+        # [B1 debug] print once so we can confirm randomization actually reached the
+        #   low-level controller (spread over envs > 0 only when DR eval is on).
+        if not self._b1_synced:
+            self._b1_synced = True
+            print(f"[NavVel B1] low-level controller synced: mass "
+                  f"mean={mass.mean().item():.5f} std={mass.std().item():.5f} "
+                  f"[{mass.min().item():.5f},{mass.max().item():.5f}] | "
+                  f"KF mean={kf.mean().item():.6f} (ctrl={type(ctl).__name__})", flush=True)
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")]

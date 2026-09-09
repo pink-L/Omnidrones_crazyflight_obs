@@ -74,6 +74,8 @@ def main(cfg):
             from omni_drones.controllers import LeePositionController
             from omni_drones.utils.torchrl.transforms import VelController
             controller = LeePositionController(9.81, base_env.drone.params).to(base_env.device)
+            # [B1 2026-09-09] mount low-level controller on env (used by controller_sync_dr).
+            base_env.low_level_controller = controller
             vl = cfg.task.get("vel_limit", {})
             transform = VelController(
                 controller,
