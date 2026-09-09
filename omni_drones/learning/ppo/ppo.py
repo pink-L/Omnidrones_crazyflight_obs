@@ -78,7 +78,11 @@ class Actor(nn.Module):
 
     def forward(self, features: torch.Tensor):
         loc = self.actor_mean(features)
-        scale = torch.exp(self.actor_std).expand_as(loc)
+        # [2026-09-08] std 上限 clamp 防熵暴涨: log_std ∈ [ln(0.05), ln(1.8)] -> std ∈ [0.05, 1.8]
+        #   (reward 收紧梯度弱时 entropy 正则曾把 std 无限推大 -> 熵 30+ -> 动作被限幅成全随机 ->
+        #    μ(mean) 学习信号被噪声淹没. 有界 std 保探索可控, 熵封顶, reward 能把 std 收到低做确定性化)
+        log_std = self.actor_std.clamp(min=-2.9957, max=0.5878)   # 0.05 / 1.8
+        scale = torch.exp(log_std).expand_as(loc)
         return loc, scale
 
 

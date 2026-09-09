@@ -223,6 +223,7 @@ class CBFVelocityFilter(Transform):
         iterations=3,
         filter_grad="detach",        # detach | through（through 保留计算图；环境中未使用）
         do_filter=True,              # False -> 只记录 v_nom 不做滤波（reward_only 模式）
+        max_vel=None,                # 平动指令限幅(m/s); None=不限(旧行为)
     ):
         if not _TORCHRL:
             raise RuntimeError("CBFVelocityFilter requires torchrl")
@@ -233,6 +234,7 @@ class CBFVelocityFilter(Transform):
         self.iterations = int(iterations)
         self.filter_grad = filter_grad
         self.do_filter = bool(do_filter)
+        self.max_vel = None if max_vel is None else float(max_vel)
 
     def _inv_call(self, tensordict):
         drone_state = tensordict[("info", "drone_state")]      # (...,13) 位置在前 [:3]
@@ -243,6 +245,11 @@ class CBFVelocityFilter(Transform):
         p_obs = obs_cbf[..., :3]                               # (...,K,3)
         r_cbf = obs_cbf[..., 3]                                # (...,K)
         active = r_cbf > 0                                     # 以半径>0 作为激活判据
+        # [fix 2026-09-07] 先把原始平动指令限幅到 ±v_max 再记录/投影(与 VelController 给物理的一致;
+        #   无界高斯策略采样可能给 ±1000 → viol 爆炸 / 滤波退化为堵死)。
+        if self.max_vel is not None:
+            action = action.clone()
+            action[..., :3] = action[..., :3].clamp(-self.max_vel, self.max_vel)
 
         if self.filter_grad == "through":
             v_nom = action[..., :3]
@@ -327,6 +334,7 @@ def build_cbf_filter(cfg, action_key=("agents", "action")):
         iterations=p["iterations"],
         filter_grad=p["filter_grad"],
         do_filter=(p["mode"] in ("filter_only", "hybrid")),
+        max_vel=p["v_max"],
     )
 
 

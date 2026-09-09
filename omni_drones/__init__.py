@@ -33,6 +33,21 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), os.path.pardir, "cfg")
 def init_simulation_app(cfg):
     # launch the simulator
     config = {"headless": cfg["headless"], "anti_aliasing": 1}
+    # [2026-09-08] 本地 WebRTC livestream: +enable_livestream=true [+livestream_port=N]
+    #   启用 omni.kit.livestream.webrtc -> 本机浏览器访问 https://<server-ip>:<port>/streaming
+    #   (需要 GUI/headless=false 提供 viewport 供推流; 默认关闭不影响现有用法)
+    if cfg.get("enable_livestream", False):
+        _ls_port = int(cfg.get("livestream_port", 8211))
+        config["extra_args"] = [
+            "--enable", "omni.kit.livestream.webrtc",
+            "--/app/livestream/protocol=webrtc",
+            f"--/app/livestream/port={_ls_port}",
+        ]
+        _addr = cfg.get("livestream_address", None)
+        if _addr:
+            config["extra_args"].append(f"--/app/livestream/publicEndpointAddress={_addr}")
+        print(f"[init_simulation_app] livestream enabled (webrtc, port={_ls_port}, "
+              f"url=https://<server-ip>:{_ls_port}/streaming)", flush=True)
     # Isaac Sim 5.1: use base.kit for GUI (includes viewport), base.python.kit for headless
     import isaacsim as _isaacsim
     _isaacsim_path = os.path.dirname(_isaacsim.__file__)

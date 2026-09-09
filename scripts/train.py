@@ -123,6 +123,13 @@ def main(cfg):
     except KeyError:
         raise NotImplementedError(f"Unknown algorithm: {cfg.algo.name}")
 
+    # [2026-09-08] warm-start: +init_ckpt=<path.pt> 从既有权重续训(PPO state dict)。
+    #   用于 8obs -> 16obs 升密度迁移: 环境起终点/obs/几何须与 init ckpt 训练一致(只改密度)。
+    _init_ckpt = cfg.get("init_ckpt", None)
+    if _init_ckpt:
+        policy.load_state_dict(torch.load(str(_init_ckpt), map_location=cfg.sim.device))
+        print(f"[train] warm-start: loaded policy from {_init_ckpt}", flush=True)
+
     frames_per_batch = env.num_envs * int(cfg.algo.train_every)
     total_frames = cfg.get("total_frames", -1) // frames_per_batch * frames_per_batch
     max_iters = cfg.get("max_iters", -1)

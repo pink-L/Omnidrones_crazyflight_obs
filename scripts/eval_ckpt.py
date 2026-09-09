@@ -5,23 +5,24 @@
 #
 # ===================== 标准验收模板（默认严格单命口径, 2026-09-07） =====================
 # 目标: 一次飞行 = 一次考核（坠毁/出界/碰撞超限 ⇒ 该 env 判 terminated 且不复活）。
-# NavVel 训练用 soft_respawn=true（软重生给多条命），但验收评估必须覆盖为 false 才是
-# 「一次飞行失败即失败」的严格口径；窗口+多命会稀释失败、数字偏乐观。环境侧与训练同构，
-# 只需配置覆盖、无需改代码（配合下方 auto_reset=False = 单命 600 步窗口）。
+# [env_design 2026-09-07] 6×6×3 NavRL 式迁移后: 训练 yaml 默认已是严格单命
+#   (soft_respawn=false + obstacle.max_collisions=1 = 坠地/OOB/首碰都硬终止, 与验收同构),
+#   故 eval 不必再覆盖 soft_respawn(保留显式给以自文档化)。eval 用固定起终点(训练用
+#   episode_sampler=edge 随机对侧), 环境侧与训练同构, 只需配置覆盖、无需改代码:
 #
 #   python eval_ckpt.py task=NavVel algo=ppo headless=true wandb.mode=disabled \
-#       task.soft_respawn=false          # ← 验收默认：严格单命（必须显式给, 否则=多命乐观口径）
+#       task.soft_respawn=false task.obstacle.max_collisions=1 \     # 严格单命(显式自文档化)
+#       task.fixed_init=[-2.8,0.0,0.5] task.fixed_target=[2.8,0.0,1.0] \  # eval 固定点(6×6×3 对侧)
 #       task.reward_scheme=f1 task.reward_fly_weight=6.0 \
 #       task.arrive_bonus=30 task.arrive_time_bonus=30 task.reward_timeout_penalty=40 \
 #       task.reward_action_smoothness_weight=0.2 \
-#       task.obstacle.num_scene=16 'task.obstacle.spawn_xy_range=[[-2.2,-2.2],[2.2,2.2]]' \
+#       task.obstacle.num_scene=16 'task.obstacle.spawn_xy_range=[[-3.0,-3.0],[3.0,3.0]]' \
 #       'task.curriculum.levels=[16]' task.curriculum.enabled=false \
-#       task.obstacle.reward_collision_edge=4 task.obstacle.reward_near_slowdown_weight=1.0 \
 #       task.cbf.mode=hybrid task.cbf.use_brake_term=false task.cbf.penalty_src=dual \
 #       task.cbf.reward_weight=0.1 task.cbf.correction_weight=0.1 task.cbf.correction_sigma=0.5 \
 #       +checkpoint=<ckpt> +rollout_steps=600 +runtime_filter=true      # ON（带 CBF filter 部署）
-#   # OFF（internalize/撤 filter 判据）换成 +runtime_filter=false；8obs 密度换 num_scene=8
-#   # + levels=[8]。obs_safety 键须与训练一致（无则不加）。
+#   # OFF（internalize/撤 filter 判据）换成 +runtime_filter=false；低密度档换 num_scene=8
+#   # + levels=[8]。obs_safety 键须与训练一致（无则不加）。障碍/密度键须与训练 ckpt 一致。
 #
 # 指标口径（eval_ckpt 直接读 env 内部计数器, 单窗口 600 步无 reset）:
 #   arr    = 窗口内曾 ‖rpos‖<arrive_radius(0.5m) 连续保持 ≥arrive_hold_steps(50步) 的 env 比例
@@ -88,6 +89,24 @@ def main(cfg):
     OmegaConf.register_new_resolver("eval", eval)
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
+    try:
+        OmegaConf.set_struct(cfg.task, False)
+    except Exception:
+        pass
+    # [2026-09-08] eval_points=fixed|train
+    #   fixed (默认) = 固定起终点(single-point acceptance, CLI 传 fixed_init/fixed_target)
+    #   train = 训练同分布(episode_sampler=edge 随机对侧起终点, 不设 fixed, 每 env 一个随机起点)
+    #           -> 验证"任意起终点泛化" policy (用户目标: 策略应应对任意 start/goal)。
+    #   确定性/探索由 set_exploration_type(MODE=mean) 决定; filter ON/OFF 由 +runtime_filter 决定
+    #   (后期 dual/filter_only 的 internalize 对照即用 fixed|train × ON|OFF)。
+    _ep = str(cfg.get("eval_points", "fixed"))
+    if _ep == "train":
+        cfg.task.fixed_init = None
+        cfg.task.fixed_target = None
+        cfg.task.episode_sampler = "edge"
+        print("[eval_ckpt] eval_points=train -> 训练同分布(edge 随机起终点), 验证任意起终点泛化")
+    else:
+        print("[eval_ckpt] eval_points=fixed -> 固定起终点(single-point acceptance)")
     # [2026-09-07] 打印 eval 口径(日志自解释): 严格单命 vs 窗口多命 + runtime filter。
     #   验收默认 = 严格单命(task.soft_respawn=false); 若为 true 是训练同构的 soft-respawn
     #   窗口口径(多命, 稀释失败, 数字偏乐观), 结果应标注口径再比较。
@@ -176,6 +195,17 @@ def main(cfg):
     base_env.enable_render(False)
 
     steps = int(cfg.get("rollout_steps", 400))
+    # [2026-09-08 reach 口径] +record_min_rpos=true: rollout callback 累积每 env 距目标的
+    #   最小距离 -> 打印 "曾到过一次(r<arrive_radius, 不需保持50步)" 比例, 用于判断 DR 崩在
+    #   "到不了目标" 还是 "到了但保持不住"(对照 arrival_rate = 曾到∧保持50)。
+    _rec = bool(cfg.get("record_min_rpos", False))
+    class _MinRposCb:
+        def __init__(self):
+            self.m = None
+        def __call__(self, env, *args):
+            r = torch.norm(env.rpos.float(), dim=-1).squeeze(-1)   # (N,)
+            self.m = r if self.m is None else torch.minimum(self.m, r)
+    _cb = _MinRposCb() if _rec else None
     td = env.reset()
     with set_exploration_type(ExplorationType.MODE):
         env.rollout(
@@ -184,7 +214,13 @@ def main(cfg):
             tensordict=td,
             auto_reset=False,
             break_when_any_done=False,
+            callback=_cb,
         )
+    if _rec:
+        ar = float(getattr(base_env, "arrive_radius", 0.5))
+        reach = (_cb.m < ar).float()
+        print(f"[eval_ckpt] REACH(到过一次 r<{ar}, 不需保持): {reach.mean().item():.3f} "
+              f"({reach.sum().item()}/{reach.numel()})  min_rpos mean={_cb.m.mean().item():.3f}", flush=True)
 
     stats = base_env.stats
     def r(k):
@@ -239,6 +275,31 @@ def main(cfg):
                           f"<0.1 count={(fmc<0.1).sum().item()}/{finite.sum().item()}")
                 else:
                     print(f"  {'min_clearance':28s} = inf (no active obstacles in eval)")
+            # [env_design 2026-09-07] 未到达 env 的结束归类(按 rollout 末状态, 单命 soft_respawn=false 有效):
+            #   类别 = crash(坠地/NaN) | oob(出界/z>z_max) | collide(碰撞边沿) | timeout(600 未到且未坠/出界)
+            #   arrived = 本窗曾到达保持(与 arrival_rate 一致, 不因其后坠/出界而撤销)
+            if hasattr(base_env, "drone_state") and hasattr(base_env, "arrival_triggered"):
+                pos = base_env.drone_state[..., :3].float()                 # (N,1,3) env frame
+                z = pos[..., 2]
+                nan = torch.isnan(pos).any(-1)
+                crash = (z < base_env.z_min) | nan
+                oob = z > base_env.z_max
+                if getattr(base_env, "arena_bound_x", None) is not None:
+                    oob = oob | (pos[..., 0].abs() > base_env.arena_bound_x) \
+                            | (pos[..., 1].abs() > base_env.arena_bound_y)
+                elif hasattr(base_env, "bound_xy"):
+                    oob = oob | (torch.norm(pos[..., :2], dim=-1) > base_env.bound_xy)
+                coll = torch.zeros_like(crash)
+                if hasattr(base_env, "ep_collision_edges"):
+                    coll = base_env.ep_collision_edges.squeeze(-1) > 0
+                arr = base_env.arrival_triggered.squeeze(-1).bool()
+                cr = crash.squeeze(-1); ob = oob.squeeze(-1); cl = coll
+                timeout = ~(cr | ob | cl | arr)          # 跑到 end 未到、没坠/出界/碰
+                print("  end-cause (per-env, not-arrived categorized):")
+                for name, m in [("crash", cr), ("oob", ob & ~cr), ("collide", cl & ~cr & ~ob),
+                                ("timeout", timeout)]:
+                    print(f"    {name:8s} = {m.sum().item():4d}   (arrived {arr[m].sum().item():4d})")
+                print(f"    {'arrived':8s} = {arr.sum().item():4d}")
             for k in ("collision", "collision_episodes", "min_clearance", "success_rate"):
                 if k in stats.keys():
                     m, s, lo, hi = r(k)
