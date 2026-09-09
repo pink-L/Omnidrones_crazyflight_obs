@@ -64,10 +64,23 @@ class ObstacleManager:
         #   场景物理障碍数 M（=num_scene, 缓冲区/prim 数）解耦：M>K 时 build_obs 每步
         #   取最近的 K 个（滑动窗口）；M<=K（默认, num_scene 未设）保持固定槽旧语义。
         self.K = int(cfg.get("max_slots", 8))
-        self.M = int(max(int(cfg.get("num_scene") or cfg.get("max_slots", 8)), self.K))
+        # [2026-09-08 pillar C] 柱组(方案A): 每柱 pillar_layers 个外接圆球沿 z 叠覆盖全高,
+        #   柱球半径固定 pillar_radius(=0.5m 柱外接 0.354), 自由球从 radius_choices 抽。
+        #   n_pillars=0 -> 原纯球语义(M 由 num_scene 定)。n_pillars>0 时 M = 柱层球 + 自由球。
+        self.n_pillars = int(cfg.get("n_pillars", 0))
+        self.pillar_layers = max(1, int(cfg.get("pillar_layers", 4)))
+        self.pillar_radius = float(cfg.get("pillar_radius", 0.354))
+        self.pillar_z_lo = float(cfg.get("pillar_z_lo", 0.4))
+        self.pillar_z_hi = float(cfg.get("pillar_z_hi", 2.6))
+        self.n_free_balls = int(cfg.get("n_free_obstacles", 0))
+        self.pillar_ball_count = self.n_pillars * self.pillar_layers
+        self.radius_choices = [float(x) for x in cfg.get("radius_choices", [0.30])]
+        if self.n_pillars > 0:
+            self.M = self.pillar_ball_count + self.n_free_balls
+        else:
+            self.M = int(max(int(cfg.get("num_scene") or cfg.get("max_slots", 8)), self.K))
         _ow = cfg.get("obs_window")
         self.obs_window = bool(self.M > self.K) if _ow is None else bool(_ow)
-        self.radius_choices = [float(x) for x in cfg.get("radius_choices", [0.30])]
         self.drone_radius = float(cfg.get("drone_radius", 0.15))
         self.inflation = float(cfg.get("inflation", 0.05))
         self.collision_margin = float(cfg.get("collision_margin", 0.05))
@@ -88,6 +101,10 @@ class ObstacleManager:
             raise ValueError("obstacle.spawn_xy_range / spawn_z_range malformed")
         self.spawn_lo = torch.cat([xy[0], zz[:1]])
         self.spawn_hi = torch.cat([xy[1], zz[1:]])
+
+        # [2026-09-08] 出生走廊净空(仅 x): 障碍逻辑球面不越过 |x|<=keepout_x (inf=不限,
+        # 向后兼容). 球心随半径收窄 |x| <= keepout_x - r_o; 施加于 _sample_one_pass/_fallback.
+        self.keepout_x = float(cfg.get("keepout_x", float("inf")))
 
         self.radius_max = max(self.radius_choices)
         self._tiers = torch.tensor(self.radius_choices, dtype=torch.float32, device=self.device)
@@ -181,6 +198,10 @@ class ObstacleManager:
             pos (n,K,3), radius (n,K), active (n,K)  -- full K-slot tensors.
         """
         n = init_pos.shape[0]
+        # [pillar C 2026-09-08] 混合布局: 固定 n_pillars 柱(每柱 pillar_layers 层外接球) +
+        #   n_free_balls 个自由球, 全部激活(忽略 n_active/level)。obs 滑动窗口(M>K)保持 62 维。
+        if self.n_pillars > 0:
+            return self._sample_pillar_mixed(init_pos, goal_pos)
         if n_active <= 0 or n == 0:
             return (torch.zeros(n, self.M, 3, device=self.device),
                     torch.zeros(n, self.M, device=self.device),
@@ -245,6 +266,10 @@ class ObstacleManager:
         for j in range(L):
             # endpoint margins for this slot's radius
             valid = (d_init >= init_min[:, j:j + 1]) & (d_goal >= goal_min[:, j:j + 1])
+            # [2026-09-08 keepout_x] 球面不出出生走廊: 球心 |x| <= keepout_x - r_o (per slot);
+            #   y/z 不受限 (口径: 逻辑球 r_o; NavVel.yaml keepout_x=2.5)
+            x_lim = self.keepout_x - rad[:, j:j + 1]                    # (n,1)
+            valid &= cand[..., 0].abs() <= x_lim
             for pk, pr in zip(placed_pos, placed_rad):
                 need = (rad[:, j] + pr + gap)[:, None]                 # (n,1)
                 valid &= torch.norm(cand - pk[:, None, :], dim=-1) >= need
@@ -259,6 +284,202 @@ class ObstacleManager:
             placed_rad.append(rad[:, j])
         pos = torch.stack(placed_pos, dim=1)                           # (n,L,3)
         return pos, rad, ok
+
+    # ------------------------------------------------------------ [pillar C]
+    # 混合布局: 柱 = 沿 z 叠 pillar_layers 个外接圆球(pillar_radius), 覆盖 [z_lo,z_hi] 全高;
+    #   柱心在 xy 平面采样(净空 init/goal + 柱间 gap + keepout_x), 自由球 3D 避开柱层球。
+    def _pillar_layer_zs(self, n):
+        """(L,) z centers of one pillar's stacked balls covering [z_lo, z_hi]."""
+        L = self.pillar_layers
+        lo = self.pillar_z_lo + self.pillar_radius
+        hi = max(lo, self.pillar_z_hi - self.pillar_radius)
+        if L <= 1:
+            return torch.tensor([(lo + hi) / 2], device=self.device)
+        return torch.linspace(lo, hi, L, device=self.device)
+
+    def _pillar_centers_pool(self, n):
+        """(n, C, 2) candidate pillar centers (xy) in the usable box (keepout applied)."""
+        xlo = self.spawn_lo[0] + 0.35
+        xhi = self.spawn_hi[0] - 0.35
+        if self.keepout_x < float("inf"):
+            k = self.keepout_x - self.pillar_radius
+            xlo = max(xlo, -k)
+            xhi = min(xhi, k)
+        ylo = self.spawn_lo[1] + 0.35
+        yhi = self.spawn_hi[1] - 0.35
+        xs = torch.arange(xlo, xhi + 1e-3, 0.35, device=self.device)
+        ys = torch.arange(ylo, yhi + 1e-3, 0.35, device=self.device)
+        gx, gy = torch.meshgrid(xs, ys, indexing="ij")
+        grid = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1)   # (C,2)
+        jitter = (torch.rand(n, 1, 2, device=self.device) - 0.5) * 0.35
+        pool = grid.unsqueeze(0) + jitter
+        lo = torch.tensor([xlo, ylo], device=self.device)
+        hi = torch.tensor([xhi, yhi], device=self.device)
+        return pool.clamp(lo, hi)
+
+    def _sample_pillar_mixed(self, init_pos, goal_pos):
+        """Sample the fixed composition: n_pillars pillars + n_free_balls free balls.
+
+        Returns (pos (n,M,3), rad (n,M), active (n,M)) with ALL M slots active.
+        Slot layout: [:nP*L] = pillar stacked balls, [nP*L:] = free balls.
+        """
+        n = init_pos.shape[0]
+        nP, L = self.n_pillars, self.pillar_layers
+        zs = self._pillar_layer_zs(n)                                 # (L,)
+        init_xy = init_pos.reshape(n, 1, 3)[..., :2]
+        goal_xy = goal_pos.reshape(n, 1, 3)[..., :2]
+        rP = self.pillar_radius + self.drone_radius + self.inflation  # 柱对无人机的有效(判定)半径
+
+        ok_p = torch.ones(n, dtype=torch.bool, device=self.device)
+        pillar_xy = torch.zeros(n, nP, 2, device=self.device)
+        if nP > 0:
+            pool2 = self._pillar_centers_pool(n)                      # (n,C,2)
+            placed_xy = []
+            for _ in range(nP):
+                d_init = torch.norm(pool2 - init_xy, dim=-1)
+                d_goal = torch.norm(pool2 - goal_xy, dim=-1)
+                valid = (d_init >= rP + self.init_clearance) & \
+                        (d_goal >= rP + self.goal_clearance)
+                for pk in placed_xy:
+                    need = 2 * self.pillar_radius + self.min_gap_between
+                    valid &= torch.norm(pool2 - pk[:, None, :], dim=-1) >= need
+                score = torch.where(
+                    valid, torch.rand(n, pool2.shape[1], device=self.device),
+                    torch.full((n, pool2.shape[1]), float("-inf"), device=self.device))
+                best = score.argmax(dim=-1)
+                chosen = pool2.gather(1, best[:, None, None].expand(-1, 1, 2)).squeeze(1)
+                any_ok = valid.any(dim=-1)
+                ok_p &= any_ok
+                placed_xy.append(chosen)
+            pillar_xy = torch.stack(placed_xy, dim=1)                 # (n,nP,2)
+
+        # pillar stacked balls: (n, nP*L, 3)
+        ppos = torch.zeros(n, nP, L, 3, device=self.device)
+        ppos[..., 0] = pillar_xy[..., 0:1]
+        ppos[..., 1] = pillar_xy[..., 1:2]
+        ppos[..., 2] = zs.view(1, 1, L)
+        pillar_balls = ppos.reshape(n, nP * L, 3)                     # (n, nP*L, 3)
+
+        # free balls (n, Mf, 3)
+        Mf = self.n_free_balls
+        radF = torch.zeros(n, Mf, device=self.device)
+        posF = torch.zeros(n, Mf, 3, device=self.device)
+        ok_f = torch.ones(n, dtype=torch.bool, device=self.device)
+        if Mf > 0:
+            radF = self._tiers[torch.randint(0, len(self._tiers), (n, Mf), device=self.device)]
+            pool3 = self._candidate_pool(n)                           # (n,C,3)
+            init3 = init_pos.reshape(n, 1, 3)
+            goal3 = goal_pos.reshape(n, 1, 3)
+            d_init = torch.norm(pool3 - init3, dim=-1)
+            d_goal = torch.norm(pool3 - goal3, dim=-1)
+            # per-free-ball distance to all pillar balls
+            d_pil = torch.norm(pool3[:, :, None, :] - pillar_balls[:, None, :, :], dim=-1)  # (n,C,nP*L)
+            min_dp = d_pil.min(dim=-1).values if nP * L > 0 else None
+            placed3 = []
+            placed_r = []
+            for j in range(Mf):
+                r_s = radF[:, j] + self.drone_radius + self.inflation  # 端点判定(对无人机)
+                valid = (d_init >= r_s[:, None] + self.init_clearance) & \
+                        (d_goal >= r_s[:, None] + self.goal_clearance)
+                if self.keepout_x < float("inf"):
+                    valid &= pool3[..., 0].abs() <= (self.keepout_x - radF[:, j:j + 1])
+                if min_dp is not None:
+                    # 球-球净空: 中心距 >= radF_j + pillar_radius + gap
+                    valid &= min_dp >= (radF[:, j][:, None] + self.pillar_radius + self.min_gap_between)
+                for pk, pr in zip(placed3, placed_r):
+                    need = radF[:, j] + pr + self.min_gap_between
+                    valid &= torch.norm(pool3 - pk[:, None, :], dim=-1) >= need[:, None]
+                score = torch.where(
+                    valid, torch.rand(n, pool3.shape[1], device=self.device),
+                    torch.full((n, pool3.shape[1]), float("-inf"), device=self.device))
+                best = score.argmax(dim=-1)
+                chosen = pool3.gather(1, best[:, None, None].expand(-1, 1, 3)).squeeze(1)
+                any_ok = valid.any(dim=-1)
+                ok_f &= any_ok
+                placed3.append(chosen)
+                placed_r.append(radF[:, j])
+            posF = torch.stack(placed3, dim=1)
+
+        if not (ok_p.all() and ok_f.all()):
+            # 兜底: rejection 补失败 env
+            pos, rad = self._fallback_pillar_mixed(init_pos, goal_pos)
+        else:
+            pos = torch.zeros(n, self.M, 3, device=self.device)
+            rad = torch.zeros(n, self.M, device=self.device)
+            pos[:, :nP * L] = pillar_balls
+            rad[:, :nP * L] = self.pillar_radius
+            pos[:, nP * L:] = posF
+            rad[:, nP * L:] = radF
+        active = torch.ones(n, self.M, dtype=torch.bool, device=self.device)
+        return pos, rad, active
+
+    def _fallback_pillar_mixed(self, init_pos, goal_pos):
+        """Rejection fallback guaranteeing a valid composition (looser gaps)."""
+        n = init_pos.shape[0]
+        nP, L = self.n_pillars, self.pillar_layers
+        zs = self._pillar_layer_zs(n)
+        init3 = init_pos.reshape(n, 1, 3)
+        goal3 = goal_pos.reshape(n, 1, 3)
+        rP = self.pillar_radius + self.drone_radius + self.inflation
+        x_hi = self.spawn_hi[0] - 0.2
+        x_lo = self.spawn_lo[0] + 0.2
+        if self.keepout_x < float("inf"):
+            k = self.keepout_x - self.pillar_radius
+            x_hi = min(x_hi, k)
+            x_lo = max(x_lo, -k)
+        y_lo = self.spawn_lo[1] + 0.2
+        y_hi = self.spawn_hi[1] - 0.2
+        px = torch.zeros(n, nP, device=self.device)
+        py = torch.zeros(n, nP, device=self.device)
+        for i in range(nP):
+            for _ in range(60):
+                cx = x_lo + (x_hi - x_lo) * torch.rand(n, device=self.device)
+                cy = y_lo + (y_hi - y_lo) * torch.rand(n, device=self.device)
+                ok = torch.ones(n, dtype=torch.bool, device=self.device)
+                if i > 0:
+                    dx = cx - px[:, :i]
+                    dy = cy - py[:, :i]
+                    ok &= (dx * dx + dy * dy).min(dim=-1).values >= (2 * self.pillar_radius) ** 2
+                ok &= torch.sqrt((cx - init3[..., 0, 0]) ** 2 + (cy - init3[..., 0, 1]) ** 2) >= rP + self.init_clearance
+                ok &= torch.sqrt((cx - goal3[..., 0, 0]) ** 2 + (cy - goal3[..., 0, 1]) ** 2) >= rP + self.goal_clearance
+                if ok.all():
+                    break
+            px[:, i] = cx
+            py[:, i] = cy
+        ppos = torch.zeros(n, nP, L, 3, device=self.device)
+        ppos[..., 0] = px.unsqueeze(-1)
+        ppos[..., 1] = py.unsqueeze(-1)
+        ppos[..., 2] = zs.view(1, 1, L)
+        pillar_balls = ppos.reshape(n, nP * L, 3)
+
+        Mf = self.n_free_balls
+        radF = self._tiers[torch.randint(0, len(self._tiers), (n, Mf), device=self.device)]
+        posF = torch.zeros(n, Mf, 3, device=self.device)
+        for j in range(Mf):
+            for _ in range(200):
+                c = (self.spawn_lo + 0.2) + (self.spawn_hi - self.spawn_lo - 0.4) * torch.rand(n, 1, 3, device=self.device)
+                if self.keepout_x < float("inf"):
+                    lim = (self.keepout_x - radF[:, j:j + 1]).clamp(min=0.0)
+                    c[..., 0] = c[..., 0].clamp(-lim, lim)
+                d_pil = torch.norm(c - pillar_balls, dim=-1).min(dim=-1).values
+                ok = torch.ones(n, dtype=torch.bool, device=self.device)
+                ok &= d_pil >= (radF[:, j] + self.pillar_radius + self.min_gap_between * 0.5)
+                ok &= torch.norm(c - init3, dim=-1).squeeze(-1) >= radF[:, j] + self.drone_radius + self.inflation + 0.02
+                ok &= torch.norm(c - goal3, dim=-1).squeeze(-1) >= radF[:, j] + self.goal_clearance * 0.5
+                if j > 0:
+                    dd = c - posF[:, :j]
+                    need = radF[:, j] + radF[:, :j] + self.min_gap_between * 0.5
+                    ok &= torch.norm(dd, dim=-1).min(dim=-1).values >= need.min(dim=-1).values
+                if ok.all():
+                    break
+            posF[:, j:j + 1] = c
+        pos = torch.zeros(n, self.M, 3, device=self.device)
+        rad = torch.zeros(n, self.M, device=self.device)
+        pos[:, :nP * L] = pillar_balls
+        rad[:, :nP * L] = self.pillar_radius
+        pos[:, nP * L:] = posF
+        rad[:, nP * L:] = radF
+        return pos, rad
 
     def _candidate_pool(self, n):
         """Jittered grid of candidate centers inside the spawn box (n, C, 3)."""
@@ -286,12 +507,16 @@ class ObstacleManager:
         base = self.spawn_lo + 0.3
         span = self.spawn_hi - self.spawn_lo - 0.6
         for j in range(L):
+            # [2026-09-08 keepout_x] fallback 同样保证球面不出走廊(球心 clamp 到 ±(keepout-r_o))
+            x_lim = (self.keepout_x - rad[:, j:j + 1]).clamp(min=0.0)   # (n,1)
             cand = base + span * torch.rand(n, 1, 3, device=self.device)
+            cand[..., 0] = cand[..., 0].clamp(-x_lim, x_lim)
             # bump candidates that are too close to init
             d = torch.norm(cand - init_pos.reshape(n, 1, 3), dim=-1)
             too_close = d < hard[:, j]
             for _ in range(8):
                 repl = base + span * torch.rand(n, 1, 3, device=self.device)
+                repl[..., 0] = repl[..., 0].clamp(-x_lim, x_lim)
                 cand = torch.where(too_close, repl, cand)
                 d = torch.norm(cand - init_pos.reshape(n, 1, 3), dim=-1)
                 too_close = d < hard[:, j]

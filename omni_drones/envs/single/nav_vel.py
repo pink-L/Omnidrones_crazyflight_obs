@@ -108,6 +108,10 @@ class NavVel(IsaacEnv):
         self.reward_gate_weight = float(cfg.task.get("reward_gate_weight", 0.0))
         # [New1/F1] 无核飞行主导权重 (f1 主项): w_f * relu(v·u_g)/vmax; 0=关 (new_reward.md §F1)
         self.reward_fly_weight = float(cfg.task.get("reward_fly_weight", 0.0))
+        # [2026-09-08 f1-圈内引导] k_in: 进 arrive_radius 圈内把 fly 替换为
+        #   r_zone = w_f + k_in*(1 - d/R) (R=arrive_radius): 边界=w_f(连续无悬崖)、中心=w_f+k_in、
+        #   随 d↓ 单调增 -> 治确定性"贴圈不进/进圈不停"; 默认 0=关(逐位兼容)
+        self.reward_zone_weight = float(cfg.task.get("reward_zone_weight", 0.0))
         # [New1/F1-②] 可选 per-step 时间成本 (仅 f1): 悬停/loiter 持续亏, 治"时间短/完成"; 默认 0=关
         self.reward_time_cost = float(cfg.task.get("reward_time_cost", 0.0))
         vl_cfg = cfg.task.get("vel_limit", None) or {}
@@ -126,6 +130,16 @@ class NavVel(IsaacEnv):
         self.bound_xy = cfg.task.get("bound_xy", 5.0)
         self.z_min = cfg.task.get("z_min", 0.15)
         self.z_max = cfg.task.get("z_max", 4.5)
+        # [env_design 2026-09-07] 6×6×3 箱式房间越界(可选): arena_bound=[bx,by] 为 x/y 半宽,
+        #   |x|>bx 或 |y|>by 即 OOB(与圆形 bound_xy 是"或"关系); None/缺省 = 不用箱式(向后兼容)。
+        #   本设计 = 6×6 房间边界 -> [3.0,3.0] (飞出房间 = 失败, 配合 soft_respawn=false 硬终止)。
+        _ab = cfg.task.get("arena_bound", None)
+        if _ab is not None:
+            self.arena_bound_x = float(_ab[0])
+            self.arena_bound_y = float(_ab[1])
+        else:
+            self.arena_bound_x = None
+            self.arena_bound_y = None
         # [M1 2026-09-04] survival / soft-respawn (diagnosed: drones keep falling
         # before they can learn to hover/navigate, see plan §10.5 + 200M-run record)
         self.soft_respawn = cfg.task.get("soft_respawn", True)
@@ -158,7 +172,13 @@ class NavVel(IsaacEnv):
             self.K = int(oc["max_slots"])          # obs 槽位窗口 K（obs 维度 = 30 + 4K）
             # [M2 2026-09-05 obs-window] num_scene M = 场景物理障碍数（缓冲区/prim 数）。
             #   M > K -> obs 每步实时取最近 K 个（滑动窗口, obs 恒 62 维）；M <= K 保持固定槽旧语义。
-            self.M = int(max(int(oc.get("num_scene") or self.K), self.K))
+            # [2026-09-08 pillar C] n_pillars>0 时 M = 柱层球数(n_pillar*pillar_layers) + 自由球数
+            #   (混合布局, 忽略 num_scene; 与 ObstacleManager 同公式保持两边一致)。
+            if int(oc.get("n_pillars", 0)) > 0:
+                self.M = int(oc.get("n_pillars", 0)) * max(1, int(oc.get("pillar_layers", 4))) \
+                    + int(oc.get("n_free_obstacles", 0))
+            else:
+                self.M = int(max(int(oc.get("num_scene") or self.K), self.K))
             _ow = oc.get("obs_window")
             self.obs_window = bool(self.M > self.K) if _ow is None else bool(_ow)
             self.obstacle_phys_radius = float(max(oc.get("radius_choices", [0.30])))
@@ -326,6 +346,17 @@ class NavVel(IsaacEnv):
                            if _fi is not None else None)
         self.fixed_target = (torch.as_tensor(_ft, dtype=torch.float32, device=self.device)
                              if _ft is not None else None)
+        # [env_design 2026-09-07] 起终点"任务采样器": uniform(全范围随机, 旧默认/向后兼容) |
+        #   edge(6×6×3 NavRL 风格: start 恒在 x 左带 [-outer,-inner], target 恒在右带
+        #   [inner,outer], y 全覆盖障碍区, z 随机 [edge_z_lo,edge_z_hi])。fixed_* 非 None 时
+        #   一律优先(fixed 常量, 与 sampler 无关, eval 用)。
+        self.episode_sampler = str(cfg.task.get("episode_sampler", "uniform"))
+        self.edge_inner = float(cfg.task.get("edge_inner", 2.6))   # 6×6 内缩 0.4 -> 2.6
+        self.edge_outer = float(cfg.task.get("edge_outer", 3.0))   # 6×6 半宽 3.0
+        _ey = cfg.task.get("edge_y_range", [-3.0, 3.0])            # y 全覆盖(障碍区)
+        _ez = cfg.task.get("edge_z_range", [0.4, 2.4])             # z 随机(> z_min 即不算坠地)
+        self.edge_y_lo, self.edge_y_hi = float(_ey[0]), float(_ey[1])
+        self.edge_z_lo, self.edge_z_hi = float(_ez[0]), float(_ez[1])
         # small initial tilt + random yaw
         self.init_rpy_dist = D.Uniform(
             torch.tensor([-0.1, -0.1, 0.0], device=self.device) * torch.pi,
@@ -352,18 +383,38 @@ class NavVel(IsaacEnv):
         # [SimpleFlight migration 2026-09-04]: buffers consumed by controller Transforms
         self.prev_actions = torch.zeros(self.num_envs, 1, 4, device=self.device)
         self.policy_actions = torch.zeros(self.num_envs, 1, 4, device=self.device)
+        # [env_design 2026-09-07] 每窗终止原因(诊断, 供 eval_ckpt 归因; 单命 soft_respawn=false 才有意义):
+        #   0=进行中 1=crash(坠地/NaN) 2=oob(出界/z>z_max) 3=collide 4=truncated未到达(超时) 5=truncated已到达
+        self.term_cause = torch.zeros(self.num_envs, 1, dtype=torch.long, device=self.device)
 
-    # [Arena1 2026-09-07] 起/终点采样: fixed_* 非 None -> 常量(全部 env 同点); 否则随机 Uniform.
+    # [Arena1 2026-09-07 / env_design 2026-09-07] 起/终点采样优先级:
+    #   fixed_* 非 None -> 常量(全部 env 同点, eval 用);
+    #   episode_sampler=="edge" -> x 边带强制对侧(训练用, NavRL 语义: start 左带 x<0 ->
+    #     target 右带 x>0, 必穿越场地中央; y 全覆盖障碍区防"贴边走逃逸不避障");
+    #   否则 -> 全范围随机 Uniform(旧默认, 向后兼容)。
+    def _sample_edge_pos(self, n, left: bool):
+        """edge 模式采样 (n,1,3): x ∈ ±[edge_inner, edge_outer) 带, y ∈ [y_lo,y_hi], z ∈ [z_lo,z_hi]."""
+        half = self.edge_inner + (self.edge_outer - self.edge_inner) * torch.rand(
+            n, 1, device=self.device)                              # [inner, outer)
+        x = -half if left else half
+        y = self.edge_y_lo + (self.edge_y_hi - self.edge_y_lo) * torch.rand(n, 1, device=self.device)
+        z = self.edge_z_lo + (self.edge_z_hi - self.edge_z_lo) * torch.rand(n, 1, device=self.device)
+        return torch.stack([x, y, z], dim=-1)                       # (n,1,3)
+
     def _sample_init_pos(self, n):
-        """(n,1,3) init poses: fixed_init 常量 或 随机 Uniform."""
+        """(n,1,3) init poses: fixed_init 常量 | edge 左带(训练) | 随机 Uniform."""
         if self.fixed_init is not None:
             return self.fixed_init.reshape(1, 1, 3).expand(n, 1, 3).clone()
+        if self.episode_sampler == "edge":
+            return self._sample_edge_pos(n, left=True)
         return self.init_pos_dist.sample((n, 1))
 
     def _sample_target_pos(self, n):
-        """(n,1,3) targets: fixed_target 常量 或 随机 Uniform."""
+        """(n,1,3) targets: fixed_target 常量 | edge 右带(训练) | 随机 Uniform."""
         if self.fixed_target is not None:
             return self.fixed_target.reshape(1, 1, 3).expand(n, 1, 3).clone()
+        if self.episode_sampler == "edge":
+            return self._sample_edge_pos(n, left=False)
         return self.target_pos_dist.sample((n, 1))
 
     def _design_scene(self):
@@ -459,13 +510,13 @@ class NavVel(IsaacEnv):
             "heading_alignment": UnboundedContinuousTensorSpec(1),
             "uprightness": UnboundedContinuousTensorSpec(1),
             "action_smoothness": UnboundedContinuousTensorSpec(1),
-            "arrival": UnboundedContinuousTensorSpec(1),   # [M1] EMA of within-radius ratio
+            "arrival": UnboundedContinuousTensorSpec(1),   # [2026-09-08] 曾到达∧保持hold_steps步(episode_any_arrival 持存); 非瞬时圈内EMA
             "vel_norm": UnboundedContinuousTensorSpec(1),  # [M1] EMA of speed
             # [M2] obstacle stats (EpisodeStats samples them at the episode end step)
             "collision": UnboundedContinuousTensorSpec(1),  # EMA frac. of steps in contact
             "collision_episodes": UnboundedContinuousTensorSpec(1),  # window had >=1 edge
             "min_clearance": UnboundedContinuousTensorSpec(1),  # EMA min surface clearance
-            "success_rate": UnboundedContinuousTensorSpec(1),  # window success (arr&0 edge)
+            "success_rate": UnboundedContinuousTensorSpec(1),  # [2026-09-08] window success = (曾到达∧保持50步) & 0碰撞 (episode_any_arrival 已含保持50步; done 事件率)
             "curriculum_level": UnboundedContinuousTensorSpec(1),  # active obstacle count
             "cbf_violation": UnboundedContinuousTensorSpec(1),  # [M2-3] CBF reward-core violation (>=0)
         }
@@ -576,6 +627,7 @@ class NavVel(IsaacEnv):
         # PBRS baseline = initial distance (per-life tracking starts clean)
         self.prev_goal_dist[env_ids] = torch.norm(target - pos, dim=-1)
         self.stats[env_ids] = 0.
+        self.term_cause[env_ids] = 0.
         if self._has_obstacles:
             self.stats["curriculum_level"][env_ids] = (
                 self.curriculum_levels[self.level_idx] if self.curriculum_levels else 0.0)
@@ -707,11 +759,14 @@ class NavVel(IsaacEnv):
                     self.obs_safety_add_cbf_margin,
                 ))
             # [M2-3] per-slot CBF ball (center + CBF radius) fed to CBFVelocityFilter
-            # before VelController each step. Inactive slots stay 0 (r_safe=0).
+            # before VelController each step. Inactive slots zeroed (pos=0, r_cbf=0) so
+            # the filter's "r_cbf>0" activation excludes them (fix 2026-09-07).
             if self.cbf_extra is not None:
-                rcbf = self.obstacles.r_safe + self.cbf_extra          # (N,K)
+                actm = self.obstacles.active.float()                  # (N,K)
+                pos_use = self.obstacles.pos * actm.unsqueeze(-1)     # inactive -> 0
+                rcbf = (self.obstacles.r_safe + self.cbf_extra) * actm
                 self.info["obstacle_cbf"][:] = torch.cat(
-                    [self.obstacles.pos, rcbf.unsqueeze(-1)], dim=-1).unsqueeze(1)
+                    [pos_use, rcbf.unsqueeze(-1)], dim=-1).unsqueeze(1)
         obs = torch.cat(obs, dim=-1)
 
         return TensorDict(
@@ -804,9 +859,26 @@ class NavVel(IsaacEnv):
                 v_lin = self.drone_state[..., 7:10]                          # (N,1,3) 平动速度
                 fly = torch.relu((v_lin * u_goal).sum(dim=-1))               # (N,1) 朝目标速率(2D)
                 fly = (fly / self.max_vel).clamp(max=1.0)
-                reward = self.reward_fly_weight * fly + reward_arrival
+                if self.reward_zone_weight > 0:
+                    # [2026-09-08] 圈内距离引导(d<arrive_radius): 替换 fly 项为
+                    #   r_zone = w_f + k_in*(1 - d/R), 边界 d=R⁻ -> w_f(与圈外前进上限连续,
+                    #   无进圈悬崖), 中心 d→0 -> w_f+k_in, 随 d↓ 严格单调增;
+                    #   到达保持(hold_steps)后另 +arrive_bonus(大稀疏) 并 success_terminate 结算。
+                    inside = pos_error < self.arrive_radius                 # (N,1) bool
+                    frac = 1.0 - (pos_error / self.arrive_radius).clamp(max=1.0)   # (N,1) 0..1
+                    zone = self.reward_fly_weight + self.reward_zone_weight * frac   # (N,1)
+                    base = torch.where(inside, zone, self.reward_fly_weight * fly)
+                    reward = base + reward_arrival
+                else:
+                    reward = self.reward_fly_weight * fly + reward_arrival
             else:
                 reward = reward_arrival
+            # [2026-09-08 PBRS-in-f1] 距离势差加入 f1: 给 μ(mean) 一个全程"净接近才得分"梯度
+            #   (悬停/远离=0 → 无悬停平台; 远端近端同效 → 无历史远端死区), 治"确定性 mean 学不会
+            #   精确入圈/停稳保持" (M1 legacy+PBRS 曾 eval_ckpt 确定性 0.99; 现 f1 一直 reward_pbrs_weight=0)。
+            #   仅 reward_pbrs_weight>0 时生效(默认 0=逐位不变); prev_goal_dist 已在 reset/respawn rebase。
+            if self.reward_pbrs_weight > 0:
+                reward = reward + reward_pbrs
             # [F1-② 可选] per-step 时间成本(治 loiter/时间短/推完成): r -= c_t 每步;
             #   默认 0=关(仅 f1 生效, legacy/r1 不受影响)。reward 为 2D (N,1), 减标量广播安全。
             if self.reward_time_cost > 0:
@@ -898,9 +970,12 @@ class NavVel(IsaacEnv):
             # (v_nom recorded by CBFVelocityFilter into info.policy_action), so the policy
             # learns that the penalized command is its own output (soft-CBF, CBF-RL).
             if self.cbf_extra is not None:
-                vnom = self.policy_actions[..., :3]                    # (N,1,3) pre-filter
+                # [fix 2026-09-07] vnom 限幅到 ±v_max(与 VelController 施加一致; 无界高斯采样可给
+                #   ±1000 → viol 爆炸); act 用 active(勿用 r_safe>0: inactive r_safe=0.2>0 会把
+                #   16 个 (0,0,0) 哨兵当激活)。
+                vnom = self.policy_actions[..., :3].clamp(-self.max_vel, self.max_vel)
                 rcbf = self.obstacles.r_safe + self.cbf_extra          # (N,K)
-                act = self.obstacles.r_safe > 0                        # (N,K)
+                act = self.obstacles.active                            # (N,K)
                 viol = cbf_violation(
                     drone_pos, vnom,
                     self.obstacles.pos.unsqueeze(1), rcbf.unsqueeze(1),
@@ -980,6 +1055,11 @@ class NavVel(IsaacEnv):
         self.life_steps += 1
         xyz = self.drone_state[..., :3]
         out_of_xy = torch.norm(xyz[..., :2], dim=-1) > self.bound_xy
+        # [env_design 2026-09-07] 箱式房间越界(arena_bound 给 x/y 半宽, 6×6×3): 飞出房间算失败
+        if self.arena_bound_x is not None:
+            abs_xy = xyz[..., :2].abs()
+            out_of_xy = out_of_xy | (abs_xy[..., 0] > self.arena_bound_x) \
+                | (abs_xy[..., 1] > self.arena_bound_y)
         crash = (xyz[..., 2] < self.z_min) | torch.isnan(self.drone_state).any(-1)
         oob = out_of_xy | (xyz[..., 2] > self.z_max)
         misbehave = crash | oob
@@ -1036,12 +1116,29 @@ class NavVel(IsaacEnv):
         if self.success_terminate:
             terminated = terminated | just_arrived
 
+        # [env_design 2026-09-07] 记录本步结束 env 的终止原因(仅单命; eval auto_reset=false 时跨步保留):
+        #   1=crash 2=oob 3=collide 4=truncated未到(timeout) 5=truncated已到. 供 eval_ckpt 归因诊断.
+        if not self.soft_respawn:
+            done_cause = (terminated | truncated).squeeze(-1)
+            cause = torch.zeros_like(misbehave, dtype=torch.long)
+            cause = torch.where(crash, torch.ones_like(cause), cause)                       # 1 crash
+            cause = torch.where(oob & ~crash, torch.full_like(cause, 2), cause)             # 2 oob
+            cause = torch.where(collide_death & ~misbehave, torch.full_like(cause, 3), cause)  # 3 collide
+            cause = torch.where(truncated & ~self.episode_any_arrival.bool(),
+                                torch.full_like(cause, 4), cause)                          # 4 timeout
+            cause = torch.where(truncated & self.episode_any_arrival.bool(),
+                                torch.full_like(cause, 5), cause)                          # 5 arrived@end
+            self.term_cause = torch.where(done_cause.unsqueeze(-1), cause, self.term_cause)
+
         # stats (EMA)
         self.stats["pos_error"].lerp_(pos_error, (1 - self.alpha))
         self.stats["heading_alignment"].lerp_(heading_alignment, (1 - self.alpha))
         self.stats["uprightness"].lerp_(self.drone_state[..., 18], (1 - self.alpha))
         self.stats["action_smoothness"].lerp_(-self.drone.throttle_difference, (1 - self.alpha))
-        self.stats["arrival"].lerp_(inside.float(), (1 - self.alpha))
+        # [2026-09-08 语义变更] arrival = "曾到达∧保持 arrive_hold_steps 步"(episode_any_arrival 持存,
+        #   reset 清 0), 不再是"瞬时在圈内 EMA"(后者 train ~0.99 假象, 与确定性 eval 严重不符)。
+        #   EpisodeStats 在 done 步采样 -> train log 的 stats.arrival = 已完成 episode 的真实到达率。
+        self.stats["arrival"][:] = self.episode_any_arrival.float()
         self.stats["vel_norm"].lerp_(torch.norm(self.drone.vel[..., :3], dim=-1), (1 - self.alpha))
         if self._has_obstacles:
             # sampled by EpisodeStats at the window-end step -> reflects whole window

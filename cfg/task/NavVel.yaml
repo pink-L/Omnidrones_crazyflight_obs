@@ -8,7 +8,10 @@ defaults:
 env:
   # [M1 2026-09-04] 128 -> 512: RTX5090D 32GB 富余, 提吞吐(采样预算见 plan §8.2.8)
   num_envs: 1024
-  max_episode_length: 600
+  # [2026-09-08] 600 -> 1000: vel~1m/s 下 6×6 直线 5.6m≈560 步打满 600, 绕障无余量;
+  #   T1000=10s 给绕障余量。⚠️ 换 T 改 time_encoding=progress/T 语义 → 旧 ckpt 不可 warm,
+  #   须 from-scratch; eval 的 +rollout_steps 必须与训练 T 一致。
+  max_episode_length: 1000
 
 # [M1 2026-09-04] Crazyflie @100Hz, velocity-command action layer
 sim:
@@ -30,34 +33,55 @@ vel_limit:
 
 time_encoding: true
 
+# [2026-09-08 DR] 域随机化(动力学, 空锚; 训练/eval 用 CLI/脚本注入):
+#   task.randomization.drone.{train,eval}.{mass_scale,t2w_scale(推力),f2m_scale(力矩),
+#   drag_coef_scale,inertia_scale,com,tau_up/down}=[lo,hi] 每 env Uniform 采样
+#   (nav_vel.py 已接 drone.setup_randomization; 例 +task.randomization.drone.train.mass_scale=[0.9,1.1])。
+#   命令速度噪声单独 = task.dr_noise_sigma (m/s, 0=关; train.py CmdGaussNoise 在 CBF filter 后)。
+randomization: {}
+
 # ---- [M1] waypoint navigation ----
-# [Arena1 2026-09-07] 改版: 全区域布障 + 固定起终点 + 总高 3m (见 drones/arena1_plan.md)。
-#   固定穿越任务: start -> goal (6×6 场地中心原点, 右手系)。
-#   fixed_init/fixed_target 非空时 env 用常量(随机模式仍在 init_pos_range/target_pos_range
-#   采样并做 min_init_target_dist 重采, 保留作兜底)。
-#   ⚠️ start z 实证定 1.0 (2026-09-07): 用户初定 0.5, 但 0.5 近地在现 sim/Crazyflie 下
-#   from-scratch 学不动(0 障碍也到不了; z=1.0 同条件 3M arrival 12%) -> 用户拍板抬高到 1.0。
-fixed_init: [-2.5, 0.0, 1.0]
-fixed_target: [2.5, 0.0, 1.5]
-target_pos_range: [[-3.0, -3.0, 1.5], [3.0, 3.0, 3.0]]   # (env frame) [low, high] (随机模式兜底)
-init_pos_range:   [[-3.0, -3.0, 1.0], [3.0, 3.0, 2.5]]
+# [env_design 2026-09-07, rev 2026-09-08] 迁移 NavRL 语义到 6×6×3 (见 drones/env_design.md):
+#   训练 = 随机起终点 episode_sampler=edge: start 恒在 x=-2.8 线(x 左), target 恒在 x=+2.8 线,
+#   y,z 随机(y∈[-2.8,2.8], z∈[0.4,2.4]) -> 每局必横穿场地中央, 防"贴边走逃逸不避障"。
+#   固定 ±2.8 = 离墙 0.2(中心判定)/机身半径~0.1(物理) 裕量, 避免旧边带 [2.6,3) 贴墙瞬时 OOB。
+#   fixed_* 非 None 时优先(常量), 仅 eval 覆盖用(见 eval_ckpt.py 顶部模板, 例如
+#   start(-2.8,0,0.5) -> goal(2.8,0,1.0))。旧 Arena1 固定穿越 = CLI 传 fixed_init/target。
+fixed_init: null
+fixed_target: null
+# (uniform 兜底仅 episode_sampler=uniform 时用; z 上限 ≤ z_max, 下限 > z_min)
+target_pos_range: [[-3.0, -3.0, 0.4], [3.0, 3.0, 2.4]]   # (env frame) [low, high]
+init_pos_range:   [[-3.0, -3.0, 0.4], [3.0, 3.0, 2.4]]
 min_init_target_dist: 1.5
 arrive_radius: 0.5
 arrive_hold_steps: 50       # 0.01s * 50 = hold 0.5s inside radius (was 100>avg ep_len)
 arrive_bonus: 10.0          # [guide §1.2-2] 调大测试: 5 -> 10
 arrive_time_bonus: 0.0      # [NR-1] navgoal 到达时间 bonus w_t: +w_t*(1 - t_arr/T); 0=仅 flat base
-success_terminate: false    # keep holding after arrival (learn to stop)
-bound_xy: 5.0              # OOB 圆形判定半径(m, 不变; 6×6 场地在 [-3,3]² 内不触发)
+success_terminate: false    # [2026-09-08 rev] 还原 G2 语义: 到达(保持50步)不终止, 继续飞到600 timeout
+                            #   (曾到达即锁存 arrival, eval 口径不受"到达后继续飞"影响; G2 0.907 即此语义)。
+                            #   ⚠️ true(到达即结算)使到达=极稀疏唯一终局出口, 靠噪声碰 -> μ(mean)学不会确定性
+                            #   导航(所有 true 轮确定性 eval≈0 的证据); zone/PBRS/隔离轮基于 true, 结论需重估。
+# [env_design] 6×6×3 房间箱式越界(与圆形 bound_xy 是"或"): |x|>3 或 |y|>3 = 飞出房间 = 失败。
+arena_bound: [3.0, 3.0]
+bound_xy: 5.0              # OOB 圆形判定半径(m; 现箱式 3.0 更严为主判据, 保留键位兼容)
 z_min: 0.15
-z_max: 3.0                 # [Arena1] 环境总高 3 m (越界上限 4.5 -> 3.0)
+z_max: 3.0                 # 环境总高 3 m (越顶即 OOB)
+# [env_design] 起终点 edge 采样参数(episode_sampler=edge, 训练默认; fixed_* 非 None 时 fixed 优先):
+episode_sampler: edge      # uniform(全范围随机, 旧兜底) | edge(6×6×3 NavRL 风格)
+edge_inner: 2.8            # [rev 2026-09-08] =edge_outer → x 固定 ±2.8 线(原边带 [2.6,3) 已废)
+edge_outer: 2.8            # 离墙 0.2(中心判定)/0.1(机身半径) 裕量
+edge_y_range: [-2.8, 2.8]  # [rev 2026-09-08] y 同裕量限幅(原 [-3,3] 已废)
+edge_z_range: [0.4, 2.4]   # z 随机(> z_min 0.15 即合法; ⚠️ <~0.6 近地可学性风险见 env_design)
 
 # [M1 2026-09-04 / guide §1.2+§6] stage-0 convergence fixes
 # [M2-0 2026-09-04] ⚠️ 默认惩罚 bake-in 为 0 = M1 已验证配方 fixctl-B (run 9eb3e923,
 #   arrival 99%)：soft_respawn + survival 0.1 + PBRS 2.0/γ0.995 + 死亡惩罚全 0 + vel 1.8。
 #   经验证：一次性死亡惩罚与 soft_respawn 多命冲突(return≈-110)。要硬终止惩罚时 CLI/此处开。
-soft_respawn: true            # 坠地/超界/NaN/碰撞超限 -> 软重置(重生, 目标/障碍不变, episode 续到600)
-survival_penalty_weight: 0.1  # r -= λ*max(0, z_ref - z)：掉到 z_ref 以下轻微惩罚
-z_ref: 1.0                    # 存活惩罚高度参考 (m)
+# [env_design 2026-09-07] 训练改"严格单命"(与 eval 同构): 坠地/OOB/碰撞(一次) 都直接终止不复活。
+#   NavRL 语义 = "碰撞即失败重抽一局"。需旧多命软重生训练时改回 true(+obstacle.max_collisions>=2)。
+soft_respawn: false           # 坠地/超界/NaN/碰撞 -> 直接 terminated(硬单命)
+survival_penalty_weight: 0.0  # [env_design] 去掉 z 轴保高惩罚(z_ref 以下不扣分, 允许低空飞行)
+z_ref: 1.0                    # 保高参考高度(现 penalty=0 无效; 保留键位兼容)
 reward_crash_penalty: 0.0     # 坠地一次性惩罚 (M2-0: 0=关, fixctl-B)
 reward_oob_penalty: 0.0       # 飞出边界一次性惩罚 (M2-0: 0=关)
 reward_timeout_penalty: 0.0   # 600 步内从未到达 -> 一次性惩罚 (M2-0: 0=关)
@@ -80,6 +104,10 @@ pbrs_gamma: 0.995
 reward_scheme: legacy            # legacy | navgoal | r1 | f1
 reward_gate_weight: 0.0          # [New1/R1] r1 的 motion-gated 接近引导权重(默认 0 关)
 reward_fly_weight: 0.0           # [New1/F1] f1 的无核飞行主导权重(默认 0 关; 探针 w_f=1.5)
+reward_zone_weight: 0.0          # [2026-09-08 f1-圈内引导] k_in: 进 arrive_radius 圈内把 fly 替换为
+                                 #   r_zone=w_f+k_in*(1-d/R): 边界=w_f(连续无悬崖)、中心=w_f+k_in、随 d↓
+                                 #   单调增(治确定性贴圈不进/进圈不停); 到达后另 +arrive_bonus 结算。
+                                 #   默认 0=关(逐位兼容); 本次 0障基线 1.5(=中心 3.0/步)
 reward_time_cost: 0.0            # [New1/F1-②] f1 可选每步时间成本 c_t(默认 0 关; 治 loiter/时间短)
 
 # ---- rewards (inherited Hover-style) ----
@@ -116,13 +144,29 @@ obstacle:
   radius_choices: [0.20, 0.30, 0.40]   # 每障碍从多档随机取半径(用户确认 2026-09-04)
   # [Arena1] 全区域布障: 球心铺满 6×6 (xy ±3, 贴边 ±2.98); 总高 3m -> 球心 z∈[0.6,2.4]
   #   (下界≥物理球 0.4+余量防穿地; 上界=2.4 -> 球顶≤2.8 < 3.0 留越顶/飞行余量)。
-  spawn_xy_range: [[-3.0, -3.0], [3.0, 3.0]]   # 球心采样范围(env 帧, 覆盖全 6×6)
+  spawn_xy_range: [[-3.0, -3.0], [3.0, 3.0]]   # 球心采样范围(env 帧, 覆盖全 6×6; y 全幅不变)
+  # [2026-09-08 keepout_x] 出生走廊净空(仅 x): 障碍逻辑球面不越过 |x|<=keepout_x,
+  #   即球心随半径收窄 |x| <= keepout_x - r_o (per-slot 施加); y 仍全幅 [-3,3]、z 不受限。
+  #   keepout_x=2.5 -> 球面最远 ±2.5, 与出生线 x=±2.8 中心距 0.3m / 无人机横向净空 ~0.15m。
+  #   (物理球固定 0.4 观感仍可能探入走廊; 判定/碰撞/reward 均按逻辑球面, 语义安全)
+  keepout_x: 2.5        # 障碍逻辑球面 |x| 上限; inf=不限(默认, 向后兼容)
+  # [2026-09-08 pillar C] 柱组混合布局(方案A: 每柱沿 z 叠 pillar_layers 个外接圆球,
+  #   覆盖 [pillar_z_lo, pillar_z_hi] 全高 -> 等效 0.5×0.5×3m 立柱 xy=外接口径)。
+  #   n_pillars>0 时忽略 num_scene, M = n_pillars*pillar_layers + n_free_obstacles;
+  #   布局=固定 n_pillars 柱 + n_free_obstacles 个自由球, 全激活。obs 滑动窗口(M>K) 保持 62 维。
+  #   例(4柱×4层外接 +12球=28): n_pillars: 4 + n_free_obstacles: 12 (+ radius_choices 自由球半径档)。
+  n_pillars: 0                 # 0=原纯球(默认); >0 = pillar 混合布局
+  pillar_layers: 4             # 每柱沿 z 叠球数
+  pillar_radius: 0.354         # 柱外接球半径 (0.5m 柱 = 0.5/sqrt(2))
+  pillar_z_lo: 0.4             # 柱覆盖 z 下界
+  pillar_z_hi: 2.6             # 柱覆盖 z 上界 (>= 无人机最高 2.4)
+  n_free_obstacles: 0          # 混合布局里的自由球数 (柱球之外)
   spawn_z_range: [0.6, 2.4]                 # z 采样(总高 3m 重设; 旧 [0.6,3.4] 超出新总高)
   drone_radius: 0.15            # Crazyflie 安全包络半径(m)
   inflation: 0.05               # 障碍膨胀 -> 判定半径 r_s = drone_radius + r_o + inflation
   collision_margin: 0.05        # d_min < 该值 = 碰撞(几何)
   danger_radius: 0.6            # d_i < 该值进入 log 距离惩罚 / 近障减速
-  max_collisions: 2             # 单条"命"内碰撞边沿累计达到 -> 软重生(记窗口失败)
+  max_collisions: 1             # [env_design] 碰撞 1 次(几何接触边沿)即本命失败(soft_respawn=false 下=硬终止)
   init_clearance: 0.15          # 起点净空(m, 见上方公式, 出生不触发碰撞)
   goal_clearance: 0.35          # 目标保持区净空(m, 留可停稳余量)
   min_gap_between: 0.25         # 障碍球间最小空隙(m)
