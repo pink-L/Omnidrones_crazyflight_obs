@@ -165,10 +165,24 @@ class MultirotorBase(RobotBase):
         self.masses = self.base_link.get_masses().clone()
         # [SimpleFlight migration 2026-09-04]: sync sim mass to the yaml value when
         # `update_sim: True` is present (Crazyflie SysID mass 0.0321 vs USD asset 0.027).
+        # [CFB 2026-09-09] update_sim now ALSO syncs the yaml inertia into the sim body.
+        #   Originally only mass was synced; with the CFB retune the inertia lives in
+        #   yaml while the USD asset still carries the small CF2.1 inertia -> the
+        #   low-level controller (mixer/attitude gains built from yaml I) would be
+        #   mismatched against the physics body I_phys, over-amplifying the attitude
+        #   loop by ~I_yaml/I_phys.
         if self.params.get("update_sim", False):
             mass_yaml = torch.full_like(self.masses, float(self.params["mass"]))
             self.base_link.set_masses(mass_yaml)
             self.masses = self.base_link.get_masses().clone()
+            _i = self.params.get("inertia")
+            if _i is not None:
+                _iv = [_i[k] for k in ("xx", "yy", "zz")]
+                _I_yaml = torch.diag_embed(
+                    torch.as_tensor(_iv, device=self.device)
+                    .unsqueeze(0).expand(self.masses.numel(), 3)
+                ).reshape(-1, 9)
+                self.base_link.set_inertias(_I_yaml)
         self.gravity = self.masses * 9.81
         self.inertias = self.base_link.get_inertias().reshape(*self.shape, 3, 3).diagonal(0, -2, -1)
         # default/initial parameters
