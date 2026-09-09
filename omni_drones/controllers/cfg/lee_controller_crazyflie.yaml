@@ -6,7 +6,11 @@
 # the ~800 rad/s^2 the motors can deliver -> saturated/unstable attitude -> the
 # drone could not hold level and sank even under hover commands (2026-09-04).
 # Re-tuned for Crazyflie: eff attitude bw ~10 rad/s, rate damping ~20.
+# [CFB 2026-09-09] Crazyflie Brushless 惯量变大 (I=diag([3.3,3.6,5.9])e-5 vs 空心杯
+#   1.4e-5/2.17e-5 -> I 放大 ~2.36/2.57/2.72x)。代码 effective=raw*I^-1, 为保持
+#   姿态带宽 ~10 rad/s 不变, raw 增益按同比例放大。position/velocity gain 在加速度
+#   域与质量无关, 不动。
 position_gain: [4, 4, 4]
 velocity_gain: [2.2, 2.2, 2.2]
-attitude_gain: [0.0014, 0.0014, 0.0022]
-angular_rate_gain: [0.00028, 0.00028, 0.00043]
+attitude_gain: [0.0033, 0.0036, 0.006]
+angular_rate_gain: [0.00066, 0.00072, 0.00117]
