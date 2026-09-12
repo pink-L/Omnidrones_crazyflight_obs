@@ -20,6 +20,7 @@ import argparse
 import glob
 import hashlib
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -65,9 +66,44 @@ def find_final(before, run_name):
     return newest
 
 
+def gpu_pids():
+    """PIDs currently holding a GPU context (empty list if nvidia-smi is unavailable)."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+            text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return []
+    return [int(t) for t in out.split() if t.strip().isdigit()]
+
+
+def clear_gpu(why):
+    """Kill anything still holding the GPU before/after a run.
+
+    WHY THIS EXISTS (2026-09-12, cost ~2 h): an Isaac process that crashes does NOT
+    always exit - it can survive with a `setproctitle`-renamed cmdline (e.g.
+    "NavVel-ppo/09-12_22-29"), so `pkill -f train.py` misses it, yet it keeps its GPU
+    memory and the next run segfaults too. Always kill by the PID nvidia-smi reports.
+    """
+    pids = gpu_pids()
+    if pids:
+        print(f"[train_batch] {why}: killing {len(pids)} process(es) still holding the "
+              f"GPU: {pids}", flush=True)
+        for p in pids:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
+        time.sleep(6)
+    return gpu_pids()
+
+
 def run_one(seed, a):
     run_name = f"{a.tag}-{seed}-final"
     log = os.path.join(a.logdir, f"train_{a.tag}_s{seed}.log")
+    left = clear_gpu(f"pre-launch(seed {seed})")
+    if left:
+        print(f"[train_batch] WARNING seed={seed}: GPU still busy after cleanup: {left}")
     cmd = [
         PYTHON, "train.py", f"task={a.profile}", "algo=ppo", "headless=true",
         "wandb.mode=online", "wandb.entity=fly-hust",
@@ -87,16 +123,30 @@ def run_one(seed, a):
     if d:
         p = os.path.join(d, "files", "checkpoint_final.pt")
         ckpt = p if os.path.isfile(p) else ""
-    print(f"[train_batch] {seed} exit={rc} elapsed={int(time.time() - t0)}s "
+    # [2026-09-12] SUCCESS IS DEFINED BY THE CHECKPOINT, NOT BY THE EXIT CODE.
+    #   On this machine Isaac also segfaults during teardown of a *successful* run, which
+    #   makes the process exit with -11 while the 20M-frame training finished and the
+    #   checkpoint was written. Judging by 'crashreporter lines present' or 'rc != 0'
+    #   wrongly marked completed runs as failures (and led to a long wild-goose chase).
+    ok = bool(ckpt)
+    if ok and rc != 0:
+        print(f"[train_batch] note seed={seed}: rc={rc} but checkpoint exists "
+              f"=> teardown crash, result OK", flush=True)
+    print(f"[train_batch] {seed} exit={rc} ok={ok} elapsed={int(time.time() - t0)}s "
           f"wandb={os.path.basename(d) if d else '?'} "
           f"ckpt={ckpt or 'NONE'} sha256={sha256(ckpt) if ckpt else '-'}", flush=True)
-    for pat in ("out of memory", "Traceback"):
-        if os.path.isfile(log):
-            with open(log, errors="ignore") as fh:
-                txt = fh.read()
-            if pat in txt:
-                print(f"[train_batch] !! seed={seed} log contains {pat!r}", flush=True)
-    return rc, ckpt
+    left = clear_gpu(f"post-run(seed {seed})")
+    if left:
+        print(f"[train_batch] WARNING seed={seed}: GPU not released by the child: {left}",
+              flush=True)
+    if not ok:
+        for pat in ("out of memory", "Traceback"):
+            if os.path.isfile(log):
+                with open(log, errors="ignore") as fh:
+                    txt = fh.read()
+                if pat in txt:
+                    print(f"[train_batch] !! seed={seed} log contains {pat!r}", flush=True)
+    return (0 if ok else rc), ckpt
 
 
 def main():
