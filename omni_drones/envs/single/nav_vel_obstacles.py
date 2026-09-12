@@ -168,6 +168,10 @@ class ObstacleManager:
             d = torch.where(self.active, d, torch.full_like(d, float("inf")))
             vals, idx = torch.topk(d, k=self.K, dim=-1, largest=False)  # (N,K)
             valid = torch.isfinite(vals)                              # (N,K)
+            # [K5 2026-09-12] 暴露本步的窗口选择, 供 eval 统计 dropped_relevant
+            #   (危险区障碍被挤出 obs 窗口 => 策略"看不见"却会被判撞). 纯诊断, 训练不使用.
+            self._obs_win_idx = idx
+            self._obs_win_valid = valid
             p_sel = self.pos.gather(
                 1, idx.clamp(min=0).unsqueeze(-1).expand(-1, -1, 3))  # (N,K,3)
             r_sel = self.radius.gather(1, idx.clamp(min=0))           # (N,K)
@@ -184,6 +188,9 @@ class ObstacleManager:
                 (self.radius / self.obs_radius_norm).clamp(0.0, 1.0).unsqueeze(-1),
             ], dim=-1)                                                # (N,K,4)
             block = block * self.active.unsqueeze(-1)
+            # [K5] 固定槽模式: 窗口 = 全部激活槽, 不存在"被挤出"的障碍
+            self._obs_win_idx = None
+            self._obs_win_valid = None
         return block.reshape(self.num_envs, 1, self.K * 4)
 
     # ------------------------------------------------------------------- layout

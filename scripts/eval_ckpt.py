@@ -93,6 +93,21 @@ def main(cfg):
         OmegaConf.set_struct(cfg.task, False)
     except Exception:
         pass
+    # [K5 2026-09-12] 可选确定性种子。plan §4.3 的 filter 依赖度要求 ON/OFF 两次评估
+    #   在**同一套障碍布局 + 同一套 DR 采样**下比较（"同 seed、同分布"）。此处显式播种,
+    #   并在报告里输出布局指纹(layout_fp)以**验证**两次跑确实同分布。
+    _sd = cfg.get("set_seed", None)
+    if _sd is not None:
+        import random as _rand
+        _sd = int(_sd)
+        torch.manual_seed(_sd)
+        _rand.seed(_sd)
+        try:
+            import numpy as _np
+            _np.random.seed(_sd)
+        except Exception:
+            pass
+        print(f"[eval_ckpt] set_seed={_sd} -> deterministic layout/DR (ON vs OFF comparable)")
     # [2026-09-08] eval_points=fixed|train
     #   fixed (默认) = 固定起终点(single-point acceptance, CLI 传 fixed_init/fixed_target)
     #   train = 训练同分布(episode_sampler=edge 随机对侧起终点, 不设 fixed, 每 env 一个随机起点)
@@ -124,6 +139,7 @@ def main(cfg):
     env_class = IsaacEnv.REGISTRY[cfg.task.name]
     base_env = env_class(cfg, headless=cfg.headless)
 
+    cbf_filter = None            # [K5 2026-09-12] 由 action_transform=="velocity" 分支赋值
     transforms = [InitTracker()]
     if cfg.task.get("ravel_obs", False):
         transforms.append(ravel_composite(base_env.observation_spec, ("agents", "observation")))
@@ -157,13 +173,25 @@ def main(cfg):
             # [2026-09-06] +runtime_filter=false disables the CBF filter transform during
             # eval (policy raw action goes straight to the controller) -> quantifies the
             # runtime-filter contribution to collision safety under perturbation.
+            # [K5 2026-09-12] runtime_filter=false 现在改为挂一个 **shadow** 滤波器：照常
+            #   计算 a_cbf 与 ‖Δa‖/h_min 做诊断，但 **不写回动作** -> 策略行为与"完全撤掉
+            #   filter"逐位一致，同时仍能量出"滤波器本会介入多少"（plan §4.3 零介入率 /
+            #   E‖Δa‖ p50,p95 / h_min^train）。O2 实测：shadow 与无滤波器 rollout 的动作
+            #   序列完全一致（见 acceptance.md 记录）。
             from omni_drones.utils.cbf import build_cbf_filter
-            if bool(cfg.get("runtime_filter", True)):
-                cbf_filter = build_cbf_filter(cfg)
-                if cbf_filter is not None:
-                    transforms.append(cbf_filter)
-            else:
-                print("[eval_ckpt] runtime_filter=false -> CBF velocity filter DISABLED")
+            cbf_filter = build_cbf_filter(
+                cfg,
+                shadow=not bool(cfg.get("runtime_filter", True)),
+                record_diag=bool(cfg.get("cbf_diag", True)),
+            )
+            if cbf_filter is not None:
+                transforms.append(cbf_filter)
+                if not bool(cfg.get("runtime_filter", True)):
+                    print("[eval_ckpt] runtime_filter=false -> CBF filter in SHADOW mode "
+                          "(a_cbf computed for diagnostics only, action passed through)")
+            elif not bool(cfg.get("runtime_filter", True)):
+                print("[eval_ckpt] runtime_filter=false -> CBF velocity filter DISABLED "
+                      "(cbf.mode=none: nothing to shadow)")
         elif action_transform == "PIDrate":
             from omni_drones.controllers import PIDRateController as _PIDRateController
             from omni_drones.utils.torchrl.transforms import PIDRateController
@@ -206,7 +234,106 @@ def main(cfg):
             r = torch.norm(env.rpos.float(), dim=-1).squeeze(-1)   # (N,)
             self.m = r if self.m is None else torch.minimum(self.m, r)
     _cb = _MinRposCb() if _rec else None
+
+    # ==================================================================================
+    # [K5 2026-09-12] plan §4.2 / §4.3 验收指标累加器（只读 env 内部状态，不改 env 行为）
+    #   arrival@r  = 距目标 < r 且连续保持 hold_02 步（0.2 s @100 Hz = 20 步）的 env 比例
+    #                （**锁存**、不看 done：与该 env 自身 arrival_triggered 的"曾到达∧保持"
+    #                 语义一致；arrival_at[0.5] 应与脚本原有的 arrival_rate 同量级互证）
+    #   stall      = 速度 < stall_vel 的步占比，**仅在未到达的 env** 上统计（防"等待"策略）
+    #   dropped_relevant = 几何净空 < danger_radius 但**未进 obs 窗口**(最近 K 个) 的障碍
+    #                      —— 策略"看不见"却会被判撞的隐患（plan §3.2/§4.2）
+    #   ⚠ 早期版本用 td["next","done"] 做单命门控，实测与 env 语义不符（env 在 rollout 中
+    #     会重置：episode_len mean≈1212<1500），会把已到达 env 误判为"死"而漏记到达 —— 已移除。
+    # ==================================================================================
+    ARR_RADII = tuple(float(x) for x in cfg.get("arr_r", [0.5, 0.3, 0.2]))
+    HOLD_02 = max(1, int(round(0.2 / float(cfg.sim.dt))))
+    STALL_V = float(cfg.get("stall_vel", 0.05))
+
+    class _AcceptanceCb:
+        def __init__(self, b):
+            n, dev = b.num_envs, b.device
+            self.n = n
+            self.inside = {r: torch.zeros(n, 1, dtype=torch.long, device=dev) for r in ARR_RADII}
+            self.arrived = {r: torch.zeros(n, 1, dtype=torch.bool, device=dev) for r in ARR_RADII}
+            self.stall_steps = torch.zeros(n, 1, device=dev)
+            self.notarrived_steps = torch.zeros(n, 1, device=dev)
+            self.oob = torch.zeros(n, 1, dtype=torch.bool, device=dev)   # "曾经" OOB
+            self.nan = torch.zeros(n, 1, dtype=torch.bool, device=dev)   # "曾经" NaN(坠毁)
+            self.dr_steps = 0.0
+            self.dr_relevant = 0.0
+            self.dr_dropped = 0.0
+            self.steps = 0
+            self.layout_fp = None            # 布局指纹（首步采样一次），验证 ON/OFF 同分布
+
+        @torch.no_grad()
+        def __call__(self, _env, *args, **kwargs):
+            b = base_env
+            self.steps += 1
+            # 0 OOB / 0 crash = "曾经发生过"口径（逐步骤计，不受终局状态影响）
+            pos_ = b.drone_state[..., :3].float()
+            self.nan |= (~torch.isfinite(pos_).all(-1))
+            oob_ = (pos_[..., 2] < b.z_min) | (pos_[..., 2] > b.z_max)
+            ax = getattr(b, "arena_bound_x", None)
+            if ax is not None:
+                oob_ = oob_ | (pos_[..., 0].abs() > ax) | (pos_[..., 1].abs() > b.arena_bound_y)
+            self.oob |= oob_
+            r = torch.norm(b.rpos.float(), dim=-1)                        # (N,1)
+            for rad in ARR_RADII:
+                self.inside[rad] = torch.where(r < rad, self.inside[rad] + 1,
+                                               torch.zeros_like(self.inside[rad]))
+                self.arrived[rad] |= (self.inside[rad] >= HOLD_02)
+            sp = torch.norm(b.drone_state[..., 7:10].float(), dim=-1)     # (N,1) 线速度
+            arrived_any = b.arrival_triggered.bool().reshape(-1, 1)
+            na = (~arrived_any) & torch.isfinite(sp)
+            self.notarrived_steps += na.float()
+            self.stall_steps += (na & (sp < STALL_V)).float()
+            # ---- dropped_relevant（仅滑动窗口模式；固定槽模式无"被挤出"） ----
+            obs = getattr(b, "obstacles", None)
+            idx = getattr(obs, "_obs_win_idx", None) if obs is not None else None
+            if obs is not None and self.layout_fp is None:
+                # 首步的布局指纹：位置/半径/激活数的和 + 首步最小净空（对置换不敏感，
+                # 不同布局几乎必不同）-> 用于确认 ON 与 OFF 跑的是**同一套**障碍布置。
+                try:
+                    cl0 = obs.clearances(b.drone_state[..., :3])
+                    mn = cl0[torch.isfinite(cl0)].min()
+                    self.layout_fp = "{:.3f}/{:.3f}/{}/{}".format(
+                        float(obs.pos.sum()), float(obs.radius.sum()),
+                        int(obs.active.sum()),
+                        ("%.3f" % float(mn)) if torch.isfinite(mn) else "inf")
+                except Exception:
+                    pass
+            if idx is not None:
+                clr = obs.clearances(b.drone_state[..., :3])               # (N,M) inf=inactive
+                rel = torch.isfinite(clr) & (clr < b.obstacle_danger_radius)
+                if rel.any():
+                    win = torch.zeros_like(rel)
+                    win.scatter_(1, idx.clamp(min=0),
+                                 torch.ones_like(idx, dtype=torch.bool))
+                    win &= rel
+                    dropped = rel & (~win)
+                    self.dr_relevant += float(rel.sum())
+                    self.dr_dropped += float(dropped.sum())
+                    self.dr_steps += float(dropped.any())
+
+    class _ChainCb:
+        def __init__(self, fns):
+            self.fns = [f for f in fns if f is not None]
+
+        def __call__(self, env, *a, **kw):
+            for f in self.fns:
+                f(env, *a, **kw)
+
+    _acc = _AcceptanceCb(base_env)
+    if cbf_filter is not None:
+        cbf_filter.reset_diag()
+    _chain = _ChainCb([_cb, _acc])
+
     td = env.reset()
+    # [K5 2026-09-12] 显存约束：torchrl 的 non-stop rollout 会把全部 T 步的 tensordict 累积
+    #   后再 stack。实测 T=1500 × num_envs=1024 会把 32 GiB 显存打爆（CUDA OOM）；
+    #   T=1500 × num_envs=512 峰值约 8–9 GiB，可 3 进程并行。评估协议因此固定为
+    #   **512 envs × 1500 步（= T，完整一局）**，并在 acceptance.md 里留档。
     with set_exploration_type(ExplorationType.MODE):
         env.rollout(
             max_steps=steps,
@@ -214,7 +341,7 @@ def main(cfg):
             tensordict=td,
             auto_reset=False,
             break_when_any_done=False,
-            callback=_cb,
+            callback=_chain,
         )
     if _rec:
         ar = float(getattr(base_env, "arrive_radius", 0.5))
@@ -311,6 +438,87 @@ def main(cfg):
                 m, s, lo, hi = r("cbf_violation")
                 print(f"  {'stats.cbf_violation (per-step, >=0)':26s} mean={m:+.4f}  std={s:.4f}  "
                       f"max={hi:+.4f}")
+
+    # ==================================================================================
+    # [K5 2026-09-12] 验收报告（plan §4.2 阶段 1 / §4.3 阶段 2）
+    #   一次跑同时给出「到达率(多半径) / stall / 碰撞 / OOB / h_min / 零介入率 / ‖Δa‖」，
+    #   并以 [eval_metrics] JSON 单行输出 -> 便于多 seed × ON/OFF 批量汇总。
+    #   注：runtime_filter=false 时 CBF 数字来自 **shadow** 滤波器 = "滤波器本会介入多少"，
+    #       是反事实量；ON 时才是真实介入。
+    # ==================================================================================
+    import json
+
+    rep = {
+        "model_id": str(cfg.get("model_id", "unknown")),
+        "checkpoint": str(cfg.checkpoint),
+        "seed": int(cfg.get("seed", -1)),
+        "runtime_filter": bool(cfg.get("runtime_filter", True)),
+        "eval_points": str(_ep),
+        "rollout_steps": int(steps),
+        "num_envs": int(base_env.num_envs),
+        "task": str(cfg.task.name),
+        "device": str(cfg.sim.device),
+        "layout_fp": _acc.layout_fp,
+    }
+    rep["arrival_at"] = {f"{r:g}": round(float(_acc.arrived[r].float().mean()), 4)
+                         for r in ARR_RADII}
+    rep["notarrived_step_frac"] = round(
+        float(_acc.notarrived_steps.sum() / max(_acc.steps * base_env.num_envs, 1)), 4)
+    rep["stall_frac"] = round(
+        float(_acc.stall_steps.sum() / _acc.notarrived_steps.sum().clamp(min=1)), 4)
+    rep["dropped_relevant_frac"] = round(
+        _acc.dr_dropped / max(_acc.dr_relevant, 1.0), 4)
+    rep["oob_envs_ever"] = int(_acc.oob.sum())
+    rep["crash_envs_ever"] = int(_acc.nan.sum())
+    rep["dropped_relevant_step_frac"] = round(
+        _acc.dr_steps / max(_acc.steps, 1), 4)
+    rep["relevant_obstacles_total"] = int(_acc.dr_relevant)
+    if hasattr(base_env, "ep_collision_edges"):
+        e = base_env.ep_collision_edges.float().squeeze(-1)
+        rep["collision_envs"] = int(e.gt(0).sum())
+        rep["collision_edges"] = int(e.sum())
+        if hasattr(base_env, "episode_any_arrival"):
+            arr = base_env.arrival_triggered.squeeze(-1).bool()
+            rep["joint_success_envs"] = int((arr & (e == 0)).sum())
+    if hasattr(base_env, "obstacles") and base_env.obstacles is not None:
+        mc = base_env.obstacles.ep_min_clearance.float().squeeze(-1)
+        f = mc[torch.isfinite(mc)]
+        if f.numel():
+            rep["min_clearance_global_min"] = round(float(f.min()), 4)
+            rep["min_clearance_env_mean"] = round(float(f.mean()), 4)
+    rep["cbf_extra"] = round(float(getattr(base_env, "cbf_extra", 0.0) or 0.0), 4)
+    if cbf_filter is not None and cbf_filter.diag_tensor() is not None:
+        dg = cbf_filter.diag_tensor().reshape(-1, 4)
+        corr, inter, hmin = dg[:, 0], dg[:, 1], dg[:, 2]
+        fin = torch.isfinite(corr)
+        cf = corr[fin]
+        rep["cbf_diag_steps"] = int(fin.sum())
+        rep["zero_intervention_rate"] = round(float((cf == 0).float().mean()), 4)
+        rep["intervened_step_frac"] = round(float((inter[fin] > 0).float().mean()), 4)
+        rep["corr_mean"] = round(float(cf.mean()), 4)
+        rep["corr_p50"] = round(float(torch.quantile(cf, 0.50)), 4)
+        rep["corr_p95"] = round(float(torch.quantile(cf, 0.95)), 4)
+        hf = hmin[torch.isfinite(hmin)]
+        rep["h_min_train"] = round(float(hf.min()), 4) if hf.numel() else None
+        rep["h_below0_frac"] = (round(float((hf < 0).float().mean()), 4)
+                                if hf.numel() else None)
+    if cbf_filter is None:
+        rep["zero_intervention_rate"] = None
+        rep["h_min_train"] = None
+
+    print("\n========== [eval_ckpt] ACCEPTANCE METRICS (plan 4.2 / 4.3) ==========")
+    print(f"  {'runtime_filter':28s} = {rep['runtime_filter']}"
+          f"{'' if rep['runtime_filter'] else '   (CBF 数值 = shadow 反事实)'}")
+    for k in ("arrival_at", "notarrived_step_frac", "stall_frac", "collision_envs",
+              "collision_edges", "oob_envs_ever", "crash_envs_ever",
+              "joint_success_envs", "min_clearance_global_min",
+              "min_clearance_env_mean", "h_min_train", "h_below0_frac",
+              "zero_intervention_rate", "intervened_step_frac", "corr_mean",
+              "corr_p50", "corr_p95", "dropped_relevant_frac",
+              "dropped_relevant_step_frac", "relevant_obstacles_total"):
+        if k in rep:
+            print(f"  {k:28s} = {rep[k]}")
+    print("[eval_metrics] " + json.dumps(rep, sort_keys=True), flush=True)
 
     simulation_app.close()
 

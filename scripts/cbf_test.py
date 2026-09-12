@@ -296,6 +296,108 @@ def t6_config_plumbing():
           and p["r_safety_margin"] == 0.1 and p["v_max"] == 1.8)
 
 
+def t9_shadow_diag():
+    """[K5 2026-09-12] CBFVelocityFilter 的 shadow / record_diag（纯诊断开关）。
+
+    契约：
+      * shadow=False, do_filter=True  -> 正常滤波（写回动作），diagnostics 记录。
+      * shadow=True                   -> **不写回**动作（策略行为 = 撤掉 filter），
+                                         但仍记录 ‖Δa‖/intervened/h_min（反事实诊断）。
+      * record_diag=False             -> 不累积（与旧行为逐位兼容）。
+      * do_filter=False, shadow=False -> 不做任何计算（reward_only 臂的旧行为）。
+    """
+    try:
+        from tensordict import TensorDict
+        from omni_drones.utils.cbf import CBFVelocityFilter
+    except Exception as e:                                   # pragma: no cover
+        check("t9 torchrl/tensordict available", False, str(e))
+        return
+
+    extra = MARGIN                     # brake off -> cbf_extra = 0.10（交付口径）
+    r_cbf = 0.30 + DRONE_R + INFL + extra          # 0.60
+    D = 0.75                                       # 中心距 -> h = 0.15, dmin = 0.25
+    center = torch.tensor([[[1.0, 0.0, 1.0]]])     # (1,1,3)
+    r_safe = torch.full((1, 1), r_cbf)
+    # 无人机在障碍 +x 侧 D 处，指令沿 +x（正对障碍）-> n·v = -1.5, alpha*h = 0.15
+    pos = torch.tensor([[[1.0 - D, 0.0, 1.0]]])    # (1,1,3)
+    v_nom = torch.tensor([[[1.5, 0.0, 0.0]]])
+
+    def run(shadow, record, v=None, p=None):
+        f = CBFVelocityFilter(alpha=ALPHA, iterations=5, do_filter=True,
+                              max_vel=V_MAX, shadow=shadow, record_diag=record)
+        td = TensorDict({
+            ("info", "drone_state"): torch.cat(
+                [p if p is not None else pos, torch.zeros(1, 1, 10)], -1),
+            ("info", "obstacle_cbf"): torch.cat(
+                [center, r_safe.unsqueeze(-1)], -1).unsqueeze(1),      # (1,1,1,4)
+            ("agents", "action"): (v if v is not None else v_nom).clone(),
+        }, [1])
+        td = f._inv_call(td)
+        return f, td[("agents", "action")]
+
+    # ---- 正常滤波 -------------------------------------------------------------
+    f, a = run(shadow=False, record=True)
+    dg = f.diag_tensor().reshape(-1, 4)
+    check("t9 filter writes back projected v",
+          abs(float(a[0, 0, 0]) - 0.15) < 1e-4, f"v_x={float(a[0,0,0]):.4f} exp=0.15")
+    check("t9 diag corr = ||Δa||", abs(float(dg[0, 0]) - 1.35) < 1e-4,
+          f"corr={float(dg[0,0]):.4f} exp=1.35")
+    check("t9 diag intervened=1", float(dg[0, 1]) == 1.0)
+    check("t9 diag h_min = dist-r_cbf", abs(float(dg[0, 2]) - 0.15) < 1e-4,
+          f"h={float(dg[0,2]):.4f} exp=0.15")
+
+    # ---- shadow：不写回，但诊断照样有 ------------------------------------------
+    f2, a2 = run(shadow=True, record=True)
+    dg2 = f2.diag_tensor().reshape(-1, 4)
+    check("t9 shadow does NOT write back", float((a2 - v_nom).abs().max()) == 0.0,
+          f"max|a-v_nom|={float((a2-v_nom).abs().max()):.3e}")
+    check("t9 shadow still records same diag",
+          abs(float(dg2[0, 0]) - 1.35) < 1e-4 and float(dg2[0, 1]) == 1.0,
+          f"corr={float(dg2[0,0]):.4f}")
+
+    # ---- 无介入：corr 精确 0 ---------------------------------------------------
+    v_away = torch.tensor([[[-1.5, 0.0, 0.0]]])     # 远离障碍
+    f3, a3 = run(shadow=False, record=True, v=v_away)
+    dg3 = f3.diag_tensor().reshape(-1, 4)
+    check("t9 no-violation -> action untouched & corr==0",
+          float((a3 - v_away).abs().max()) == 0.0 and float(dg3[0, 0]) == 0.0
+          and float(dg3[0, 1]) == 0.0,
+          f"corr={float(dg3[0,0]):.1e} intervened={float(dg3[0,1]):.1f}")
+
+    # ---- record_diag=False -> 不累积（旧行为） ---------------------------------
+    f4, _ = run(shadow=False, record=False)
+    check("t9 record_diag=False -> empty log", f4.diag_tensor() is None
+          and f4.diag_steps == 0)
+
+    # ---- do_filter=False & shadow=False -> 完全不计算（reward_only 旧行为） -----
+    f5 = CBFVelocityFilter(alpha=ALPHA, iterations=5, do_filter=False,
+                           max_vel=V_MAX, record_diag=True)
+    td = TensorDict({
+        ("info", "drone_state"): torch.cat([pos, torch.zeros(1, 1, 10)], -1),
+        ("info", "obstacle_cbf"): torch.cat(
+            [center, r_safe.unsqueeze(-1)], -1).unsqueeze(1),
+        ("agents", "action"): v_nom.clone(),
+    }, [1])
+    td = f5._inv_call(td)
+    check("t9 reward_only path unchanged (no compute, action untouched)",
+          float((td[("agents", "action")] - v_nom).abs().max()) == 0.0
+          and f5.diag_tensor() is None)
+
+    # ---- config 接线 ----------------------------------------------------------
+    from omegaconf import OmegaConf
+    base = OmegaConf.create({"task": {
+        "cbf": {"mode": "hybrid", "alpha": 1.0},
+        "obstacle": {"drone_radius": DRONE_R, "inflation": INFL},
+        "vel_limit": {"max_vel": V_MAX},
+    }})
+    tf = build_cbf_filter(base, shadow=True, record_diag=True)
+    check("t9 build_cbf_filter passes shadow/record_diag",
+          tf is not None and tf.shadow and tf.record_diag and tf.do_filter)
+    check("t9 build defaults -> shadow=False (逐位兼容)",
+          build_cbf_filter(base).shadow is False
+          and build_cbf_filter(base).record_diag is False)
+
+
 if __name__ == "__main__":
     t1_radius()
     t2_head_on_projected()
@@ -305,6 +407,7 @@ if __name__ == "__main__":
     t6_config_plumbing()
     t7_safety_obs_channels()
     t8_h_boundary_penalty()
+    t9_shadow_diag()
     print()
     if _fail:
         print(f"RESULT: {len(_fail)} FAILED -> {_fail}")
