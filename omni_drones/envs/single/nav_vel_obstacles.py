@@ -48,6 +48,30 @@ perception (radar/camera estimates) replaces ground truth later.
 import torch
 
 
+def scene_slot_count(oc) -> int:
+    """Number of physical obstacle slots (M) implied by an ``obstacle.*`` config.
+
+    SINGLE SOURCE OF TRUTH. Both the env (which allocates the RigidPrimView with M prims)
+    and the ObstacleManager (which allocates M slot buffers) must call this. When the two
+    sides disagreed, reset() raised a shape mismatch inside set_world_poses and Isaac's
+    shutdown path turned it into a SIGSEGV - that is how the first A2 run died twice
+    (2026-09-12): the manager reserved n_max*L_max = 24 slots while the env still computed
+    n_pillars*pillar_layers = 16.
+
+    Randomised layouts (A2/A3) reserve the UPPER bound, because the number of active slots
+    varies per env/episode; unused slots are marked inactive.
+    """
+    K = int(oc.get("max_slots", 8))
+    npr = oc.get("n_pillars_range", None)
+    plr = oc.get("pillar_layers_range", None)
+    pzr = oc.get("pillar_z_range", None)
+    if int(oc.get("n_pillars", 0)) > 0 or any(x is not None for x in (npr, plr, pzr)):
+        nP = int(npr[1]) if npr is not None else int(oc.get("n_pillars", 0))
+        L = int(plr[1]) if plr is not None else max(1, int(oc.get("pillar_layers", 4)))
+        return nP * L + int(oc.get("n_free_obstacles", 0))
+    return int(max(int(oc.get("num_scene") or K), K))
+
+
 class ObstacleManager:
     """Per-env static obstacle bookkeeping + layout sampling + geometry helpers.
 

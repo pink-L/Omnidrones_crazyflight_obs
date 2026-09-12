@@ -32,7 +32,7 @@ from omni_drones.utils.torch import euler_to_quaternion, quat_axis
 from tensordict.tensordict import TensorDict, TensorDictBase
 from omni_drones.utils.torchrl.compat import CompositeSpec, UnboundedContinuousTensorSpec
 from omni_drones.envs.utils import create_obstacle
-from omni_drones.envs.single.nav_vel_obstacles import ObstacleManager
+from omni_drones.envs.single.nav_vel_obstacles import ObstacleManager, scene_slot_count
 from omni_drones.utils.nav_curriculum import ObstacleCurriculum
 from omni_drones.utils.cbf import (
     cbf_violation,
@@ -173,12 +173,14 @@ class NavVel(IsaacEnv):
             # [M2 2026-09-05 obs-window] num_scene M = 场景物理障碍数（缓冲区/prim 数）。
             #   M > K -> obs 每步实时取最近 K 个（滑动窗口, obs 恒 62 维）；M <= K 保持固定槽旧语义。
             # [2026-09-08 pillar C] n_pillars>0 时 M = 柱层球数(n_pillar*pillar_layers) + 自由球数
-            #   (混合布局, 忽略 num_scene; 与 ObstacleManager 同公式保持两边一致)。
-            if int(oc.get("n_pillars", 0)) > 0:
-                self.M = int(oc.get("n_pillars", 0)) * max(1, int(oc.get("pillar_layers", 4))) \
-                    + int(oc.get("n_free_obstacles", 0))
-            else:
-                self.M = int(max(int(oc.get("num_scene") or self.K), self.K))
+            #   (混合布局, 忽略 num_scene)。
+            # [P1 A2/A3 2026-09-12] 随机化路径（n_pillars_range / pillar_layers_range）下，
+            #   ObstacleManager 用 **上界** n_max*L_max 预留槽位 ⇒ 这里必须同样用上界，否则
+            #   `obstacle_views`（prim 数）与采到的障碍数不一致，reset 时 set_world_poses
+            #   会 shape mismatch（1024×24 vs 1024×16）→ Isaac 再把它放大成 SIGSEGV。
+            #   公式现收敛到 ObstacleManager 侧的 `scene_slot_count` **单一来源**，
+            #   并在 manager 构造后断言一致。
+            self.M = scene_slot_count(oc)
             _ow = oc.get("obs_window")
             self.obs_window = bool(self.M > self.K) if _ow is None else bool(_ow)
             self.obstacle_phys_radius = float(max(oc.get("radius_choices", [0.30])))
@@ -297,6 +299,15 @@ class NavVel(IsaacEnv):
             )
             self.obstacle_views.initialize()
             self.obstacles = ObstacleManager(self._obstacle_cfg, self.num_envs, self.device)
+            # [P1 2026-09-12] 两处独立算 M（env 算 prim 数、manager 算槽位）→ 必须一致。
+            #   不一致的表现是 reset 时 set_world_poses shape mismatch，再被 Isaac 的
+            #   关闭路径放大成 SIGSEGV（A2 首次开训就是这样丢了两条 20M run）。
+            #   这里排错一次，让这类不一致当场报错。
+            if int(self.obstacles.M) != int(self.M):
+                raise RuntimeError(
+                    f"obstacle slot count mismatch: env M={self.M} vs manager M="
+                    f"{self.obstacles.M} (check n_pillars/_range and pillar_layers/_range "
+                    f"in the profile - both sides must use the same upper bound)")
 
             cc = self._curriculum_cfg or {}
             # [New2/E3] margin gate: 提升还需窗口滚动 margin_ok_rate >= margin_frac
