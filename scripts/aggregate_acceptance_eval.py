@@ -71,11 +71,29 @@ def main():
     ap.add_argument("--logdir", required=True)
     ap.add_argument("--out", default=None)
     ap.add_argument("--label", default="unnamed")
+    ap.add_argument("--allow-partial", action="store_true",
+                    help="emit the table even if some logs have no [eval_metrics] line")
     args = ap.parse_args()
 
     runs = load(args.logdir)
     if not runs:
         raise SystemExit(f"[aggregate] no usable logs in {args.logdir}")
+    # ---- completeness guard ---------------------------------------------------
+    # load() silently skips a log whose [eval_metrics] line is absent - which happens when
+    # the aggregator runs while the last eval is still finishing. That produced a table
+    # with a '-' column AND a bogus "layout_fp identical: False" verdict (2026-09-12, A1a),
+    # so refuse to emit a partial table instead.
+    expected = sorted(os.path.basename(p) for p in
+                      glob.glob(os.path.join(args.logdir, "s*_on.log")) +
+                      glob.glob(os.path.join(args.logdir, "s*_off.log")))
+    got = {f"{r['_tag']}.log" for r in runs}
+    missing = [e for e in expected if e not in got]
+    if missing and not args.allow_partial:
+        print(f"[aggregate] ERROR incomplete batch: {len(runs)}/{len(expected)} logs carry "
+              f"[eval_metrics]; missing {missing}")
+        print("[aggregate] refusing to emit a partial table "
+              "(pass --allow-partial to override)")
+        return 2
     seeds = sorted({r["_seed"] for r in runs})
     modes = ["on", "off"]
     by = {(r["_seed"], r["_mode"]): r for r in runs}
@@ -164,10 +182,12 @@ def main():
     }
 
     print(f"\n===== acceptance report: {args.label} =====")
+    fp_bad = [s for s in seeds
+              if out['layout_fp'].get(f's{s}_on') != out['layout_fp'].get(f's{s}_off')]
     print(f"protocol: {out['protocol']['design']}")
-    print(f"seeds   : {seeds}   layout_fp ON/OFF identical per seed: "
-          + str(all(out['layout_fp'].get(f's{s}_on') == out['layout_fp'].get(f's{s}_off')
-                    for s in seeds)))
+    print(f"seeds   : {seeds}"
+          + (f"   layout_fp ON/OFF identical per seed: True" if not fp_bad else
+             f"   !! layout_fp MISMATCH for seeds {fp_bad} - ON/OFF not the same layout"))
     print()
     print("\n".join(lines))
     print("\ngates (plan 4.1/4.3):")
