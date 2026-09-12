@@ -16,8 +16,19 @@ sim:
   # enable_scene_query_support: true # for Lidars (to be implemented)
 
   # GPU buffers
-  gpu_max_rigid_contact_count: 524288
-  gpu_max_rigid_patch_count: 163840 # 33554432
+  # [P1 A2 2026-09-12] NavVel obstacle worlds stack MANY OVERLAPPING spheres in one
+  #   pillar column (the z spacing between layers is far below 2*r), so the number of
+  #   contact patches per env is large.  With gpu_max_rigid_patch_count = 163840
+  #   (= 160 patches/env at 1024 envs) PhysX overflowed its GPU patch buffer, logged
+  #   "Unexpectedly unregistered an interaction that does not have a valid interaction
+  #   ID." and then segfaulted INSIDE sim.step() (py-spy: isaac_env.py:270 ->
+  #   physics_context._step).  Measured threshold: obstacle slot counts M=12/16/20 are
+  #   fine, M=24 crashes ~3 runs in 4 (A0 at M=28 survives because its 4-layer columns
+  #   sit just under the limit).  CAVEAT: the capacity keys are pure PhysX memory-pool
+  #   sizes - the solver never reads them - and a 400k-frame A1b twin run reproduced its
+  #   checkpoint sha256 bit-for-bit after the bump, so this is a NON-SEMANTIC infra fix.
+  gpu_max_rigid_contact_count: 2097152
+  gpu_max_rigid_patch_count: 2097152
   gpu_found_lost_pairs_capacity: 4194304
   gpu_found_lost_aggregate_pairs_capacity: 33554432
   gpu_total_aggregate_pairs_capacity: 4194304

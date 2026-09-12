@@ -186,8 +186,12 @@ sim:
   gpu_heap_capacity: 67108864
   gpu_max_num_partitions: 8
   gpu_max_particle_contacts: 1048576
-  gpu_max_rigid_contact_count: 524288
-  gpu_max_rigid_patch_count: 163840
+  # [P1 A2 2026-09-12] 524288/163840 -> 2097152/2097152: PhysX GPU contact/patch pool.
+  #   The obstacle worlds stack overlapping spheres per pillar => many patches/env;
+  #   163840 (=160/env) overflowed => "Unexpectedly unregistered an interaction" +
+  #   segfault in sim.step() at M>=24.  Non-semantic (bit-exact verified); see plan 0.5.13.
+  gpu_max_rigid_contact_count: 2097152
+  gpu_max_rigid_patch_count: 2097152
   gpu_max_soft_body_contacts: 1048576
   gpu_temp_buffer_capacity: 16777216
   gpu_total_aggregate_pairs_capacity: 4194304
