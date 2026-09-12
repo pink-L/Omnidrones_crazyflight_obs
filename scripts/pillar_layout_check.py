@@ -76,6 +76,22 @@ def xy_grid_bfs(blocked, cell, lo, hi, start_xy, goal_xy):
     return False
 
 
+def _resolve_profile(p):
+    """Accept `profiles/A2`, `profiles/A2.yaml`, `cfg/profiles/A2`, ... .
+
+    The other navvel scripts (acceptance_eval, train_batch) take `--profile profiles/A2`,
+    but this one used to join the raw string onto the repo root and therefore needed
+    `cfg/profiles/A2.yaml` - a difference that only shows up as a confusing
+    FileNotFoundError.  Try every plausible spelling instead.
+    """
+    cands = [os.path.join(REPO, p), os.path.join(REPO, p + ".yaml"),
+             os.path.join(REPO, "cfg", p), os.path.join(REPO, "cfg", p + ".yaml")]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    raise SystemExit("profile not found: %s\n  tried: %s" % (p, cands))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--profile", default="cfg/profiles/A.yaml")
@@ -92,7 +108,7 @@ def main():
     ap.add_argument("--cell", type=float, default=0.05)
     a = ap.parse_args()
 
-    task = OmegaConf.load(os.path.join(REPO, a.profile))
+    task = OmegaConf.load(_resolve_profile(a.profile))
     task = task.get("task", task)
     oc = task.obstacle
     Mgr = load_manager_class()
