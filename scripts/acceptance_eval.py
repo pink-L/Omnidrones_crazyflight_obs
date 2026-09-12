@@ -47,6 +47,9 @@ def parse_spec(spec):
 
 def run_one(spec, a):
     seed, mode, ckpt = parse_spec(spec)
+    # the worker runs with cwd=HERE (scripts/), so a relative --checkpoint would resolve
+    # against scripts/ and silently fail with FileNotFoundError deep inside torch.load.
+    ckpt = os.path.abspath(ckpt)
     if not os.path.isfile(ckpt):
         print(f"[acceptance] SKIP {spec}: checkpoint not found ({ckpt})")
         return 1, spec
