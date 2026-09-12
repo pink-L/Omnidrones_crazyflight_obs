@@ -77,18 +77,62 @@ def gpu_pids():
     return [int(t) for t in out.split() if t.strip().isdigit()]
 
 
+def _siblings_and_self():
+    """PIDs whose ancestry chain still reaches this batch's root process.
+
+    WHY: the parent is only a scheduler - each seed is a separate `--child` process, and
+    each child calls `clear_gpu()` before launching its `train.py`.  Without this guard a
+    child kills every GPU process it can see, which includes the train.py of a SIBLING
+    seed that is still finishing.  That is not hypothetical: batch `cfb-dual-chiA-a2d`
+    reported `seed 11 rc=-9` for exactly this reason (it survived only because the
+    checkpoint had already been written).
+
+    The guard is safe for the case it is meant to catch: a train.py left behind by a
+    CRASHED seed is reparented to init when its child exits, so it no longer descends
+    from the batch root and is collected as intended.
+    """
+    root = os.environ.get("NAVVEL_BATCH_ROOT")
+    if not root:
+        return set()
+    root = int(root)
+    ppid = {}
+    for p in glob.glob("/proc/[0-9]*/stat"):
+        try:
+            with open(p, errors="ignore") as fh:
+                fields = fh.read().rsplit(") ", 1)[1].split()
+            ppid[int(p.split("/")[2])] = int(fields[1])
+        except (OSError, IndexError, ValueError):
+            continue
+    own = set()
+    for pid in list(ppid):
+        cur, hops = pid, 0
+        while cur > 1 and hops < 64:
+            if cur == root:
+                own.add(pid)
+                break
+            cur = ppid.get(cur, 1)
+            hops += 1
+    return own
+
+
 def clear_gpu(why):
-    """Kill anything still holding the GPU before/after a run.
+    """Kill leftover GPU processes that no longer belong to this batch.
 
     WHY THIS EXISTS (2026-09-12, cost ~2 h): an Isaac process that crashes does NOT
     always exit - it can survive with a `setproctitle`-renamed cmdline (e.g.
     "NavVel-ppo/09-12_22-29"), so `pkill -f train.py` misses it, yet it keeps its GPU
-    memory and the next run segfaults too. Always kill by the PID nvidia-smi reports.
+    memory and the next run segfaults too.  Always kill by the PID nvidia-smi reports.
     """
-    pids = gpu_pids()
+    keep = _siblings_and_self()
+    all_pids = gpu_pids()
+    pids = [p for p in all_pids if p not in keep]
+    skipped = [p for p in all_pids if p in keep]
+    if skipped:
+        print(f"[train_batch] {why}: keeping {len(skipped)} live batch process(es): "
+              f"{skipped}", flush=True)
     if pids:
-        print(f"[train_batch] {why}: killing {len(pids)} process(es) still holding the "
-              f"GPU: {pids}", flush=True)
+        print(f"[train_batch] {why}: killing {len(pids)} leftover GPU process(es): "
+              f"{pids}", flush=True)
         for p in pids:
             try:
                 os.kill(p, signal.SIGKILL)
@@ -167,6 +211,8 @@ def main():
     os.makedirs(a.logdir, exist_ok=True)
     if not os.path.isfile(a.init_ckpt):
         raise SystemExit(f"--init-ckpt not found: {a.init_ckpt}")
+    # let every child (and grandchild) recognise its own siblings - see clear_gpu()
+    os.environ["NAVVEL_BATCH_ROOT"] = str(os.getpid())
 
     queue, running, worst = list(a.seeds), [], 0
     # forward the parent's options EXPLICITLY: passing sys.argv through would also
