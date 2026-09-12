@@ -81,6 +81,51 @@ class ObstacleManager:
             self.M = int(max(int(cfg.get("num_scene") or cfg.get("max_slots", 8)), self.K))
         _ow = cfg.get("obs_window")
         self.obs_window = bool(self.M > self.K) if _ow is None else bool(_ow)
+
+        # ================= [P1 A2/A3 2026-09-12] 随机化柱布局（可选，默认全关） =================
+        #   设计纪律：**新增独立路径**，uniform 路径（_sample_pillar_mixed）一行不改
+        #   ⇒ A0/A/A1a/A1b 已冻结 profile 的采样分布逐位不变，单变量对比成立。
+        #     n_pillars_range     [lo,hi] 每 env 柱数随机（A3；默认 null = 用 n_pillars）
+        #     pillar_layers_range [lo,hi] 每柱层数随机（A2；默认 null = 用 pillar_layers）
+        #     pillar_z_range      [[zlo_lo,zlo_hi],[zhi_lo,zhi_hi]] 每柱 z 跨度随机（A2）
+        #     min_corridor        柱间最小**表面净宽**下界（A3；覆盖 min_gap_between 的约束）
+        #     layout_tries        采样重试次数，超限则逐次放松 gap（默认 6）
+        _npr = cfg.get("n_pillars_range", None)
+        _plr = cfg.get("pillar_layers_range", None)
+        _pzr = cfg.get("pillar_z_range", None)
+        self.n_pillars_range = list(_npr) if _npr is not None else None
+        self.pillar_layers_range = list(_plr) if _plr is not None else None
+        self.pillar_z_range = ([list(v) for v in _pzr] if _pzr is not None else None)
+        self.min_corridor = (float(cfg["min_corridor"])
+                             if cfg.get("min_corridor", None) is not None else None)
+        if self.min_corridor is not None:
+            # [P1 A3 2026-09-12] 语义澄清 + fail-fast：
+            #   走廊下界 W **不是**"柱对间距 >= W"（8 根 r_o=0.42 的柱在 6 m 场地里
+            #   根本做不到：需要的中心距 = 2r+W = 2.19 m），而是"存在一条起点→终点、
+            #   瓶颈净宽 >= W 的通路"。后者必须在采样后做**阈值化连通性校验**（栅格 BFS，
+            #   阻挡判据 = ‖xy-p_i‖ < r_o + W/2）并在失败时重采/减柱。
+            #   该门禁尚未实现 ⇒ 先拒绝构造，避免"带着未验证世界开训"。
+            raise NotImplementedError(
+                "obstacle.min_corridor (A3 corridor/connectivity gate) is not implemented "
+                "yet: it must be a bottleneck-connectivity check, not a pairwise pillar "
+                "spacing floor. See plan 3.2 (G8/G10). Remove the key to sample without it.")
+        self.layout_tries = int(cfg.get("layout_tries", 6))
+        self.pillar_random = any(x is not None for x in
+                                 (self.n_pillars_range, self.pillar_layers_range,
+                                  self.pillar_z_range))
+        self.layout_relax_events = 0
+        if self.pillar_random:
+            self.n_pillars_max = (int(self.n_pillars_range[1]) if self.n_pillars_range
+                                  else self.n_pillars)
+            self.pillar_layers_max = (int(self.pillar_layers_range[1])
+                                      if self.pillar_layers_range else self.pillar_layers)
+            # 槽位 = n_max * L_max（每柱预留固定块），未用槽 active=False
+            self.M = self.n_pillars_max * self.pillar_layers_max + self.n_free_balls
+            if _ow is None:
+                self.obs_window = bool(self.M > self.K)
+            print(f"[ObstacleManager] randomized pillars ON: n_pillars<={self.n_pillars_max} "
+                  f"layers<={self.pillar_layers_max} -> M={self.M} "
+                  f"min_corridor={self.min_corridor} tries={self.layout_tries}")
         self.drone_radius = float(cfg.get("drone_radius", 0.15))
         self.inflation = float(cfg.get("inflation", 0.05))
         self.collision_margin = float(cfg.get("collision_margin", 0.05))
@@ -207,6 +252,9 @@ class ObstacleManager:
         n = init_pos.shape[0]
         # [pillar C 2026-09-08] 混合布局: 固定 n_pillars 柱(每柱 pillar_layers 层外接球) +
         #   n_free_balls 个自由球, 全部激活(忽略 n_active/level)。obs 滑动窗口(M>K)保持 62 维。
+        if self.pillar_random:
+            # [P1 A2/A3 2026-09-12] 随机化路径（柱数/层数/z 跨度），见 __init__ 说明
+            return self._sample_pillar_random(init_pos, goal_pos)
         if self.n_pillars > 0:
             return self._sample_pillar_mixed(init_pos, goal_pos)
         if n_active <= 0 or n == 0:
@@ -419,6 +467,109 @@ class ObstacleManager:
             rad[:, nP * L:] = radF
         active = torch.ones(n, self.M, dtype=torch.bool, device=self.device)
         return pos, rad, active
+
+    # ------------------------------------------------- [P1 A2/A3] 随机化柱布局
+    def _sample_pillar_random(self, init_pos, goal_pos):
+        """Randomised pillar layout: per-env pillar count / per-pillar layer count and
+        z-span (A2), optional pillar-to-pillar corridor lower bound and spawn/goal
+        clearance relaxation with retries (A3).
+
+        Slot numbering is **fixed-block**: pillar p always owns `[p*L_max, (p+1)*L_max)`,
+        so an env with fewer pillars/layers simply leaves the tail slots inactive
+        (`active=False`). `clearances()` masks inactive slots to +inf and `build_obs`
+        picks the nearest K among the finite ones, so the existing obs/window machinery
+        needs no change.
+
+        Returns (pos (n,M,3), rad (n,M), active (n,M)). The uniform path
+        (`_sample_pillar_mixed`) is untouched: this method is only reachable when one of
+        `n_pillars_range` / `pillar_layers_range` / `pillar_z_range` is set.
+        """
+        n = init_pos.shape[0]
+        dev = self.device
+        nP_max, L_max = self.n_pillars_max, self.pillar_layers_max
+        if self.n_free_balls > 0:
+            raise NotImplementedError(
+                "randomized pillar layout with free balls is not implemented "
+                "(A2/A3 profiles keep n_free_obstacles=0)")
+        r = self.pillar_radius
+        rP = r + self.drone_radius + self.inflation
+        init_xy = init_pos.reshape(n, 1, 3)[..., :2]
+        goal_xy = goal_pos.reshape(n, 1, 3)[..., :2]
+        pool2 = self._pillar_centers_pool(n)                          # (n,C,2)
+        k_lay = torch.arange(L_max, device=dev).float()[None, None, :]  # (1,1,L)
+        k_idx = torch.arange(L_max, device=dev)[None, :]                # (1,L)
+
+        np_lo, np_hi = (self.n_pillars_range if self.n_pillars_range
+                        else [self.n_pillars, self.n_pillars])
+        lay_lo, lay_hi = (self.pillar_layers_range if self.pillar_layers_range
+                          else [self.pillar_layers, self.pillar_layers])
+        if self.pillar_z_range:
+            (zl0, zl1), (zh0, zh1) = self.pillar_z_range
+        else:
+            (zl0, zl1), (zh0, zh1) = ((self.pillar_z_lo, self.pillar_z_lo),
+                                      (self.pillar_z_hi, self.pillar_z_hi))
+
+        last = None
+        for attempt in range(max(self.layout_tries, 1)):
+            relax = 0.9 ** attempt            # 0.9^0 = 1.0 -> 首次完全不放松
+            # NOTE: min_corridor is deliberately NOT used here - a corridor requirement is
+            # a bottleneck-connectivity property of the whole layout, not a pairwise
+            # pillar spacing floor (see __init__).
+            need_gap = 2.0 * r + self.min_gap_between
+            v_init = self.init_clearance * relax
+            v_goal = self.goal_clearance * relax
+
+            nP_e = torch.randint(int(np_lo), int(np_hi) + 1, (n,), device=dev).clamp(min=1)
+            L_e = torch.randint(int(lay_lo), int(lay_hi) + 1, (n, nP_max), device=dev)
+            z_lo = torch.empty(n, nP_max, device=dev).uniform_(float(zl0), float(zl1))
+            z_hi = torch.empty(n, nP_max, device=dev).uniform_(float(zh0), float(zh1))
+            z_hi = torch.maximum(z_hi, z_lo + 2.0 * r)      # 至少容得下 1 层
+
+            # --- greedy xy placement (same scheme as the uniform path) ---
+            chosen = torch.zeros(n, nP_max, 2, device=dev)
+            ok = torch.ones(n, dtype=torch.bool, device=dev)
+            d_init = (pool2 - init_xy).norm(dim=-1)
+            d_goal = (pool2 - goal_xy).norm(dim=-1)
+            base = (d_init >= rP + v_init) & (d_goal >= rP + v_goal)
+            for p in range(nP_max):
+                valid = base.clone()
+                for q in range(p):
+                    valid &= (pool2 - chosen[:, q][:, None, :]).norm(dim=-1) >= need_gap
+                score = torch.where(
+                    valid, torch.rand(n, pool2.shape[1], device=dev),
+                    torch.full((n, pool2.shape[1]), float("-inf"), device=dev))
+                b = score.argmax(dim=-1)
+                chosen[:, p] = pool2.gather(
+                    1, b[:, None, None].expand(-1, 1, 2)).squeeze(1)
+                ok &= valid.any(dim=-1)
+
+            # --- fill fixed blocks; tail slots stay inactive ---
+            pos = torch.zeros(n, self.M, 3, device=dev)
+            rad = torch.zeros(n, self.M, device=dev)
+            act = torch.zeros(n, self.M, dtype=torch.bool, device=dev)
+            span = torch.clamp(z_hi - z_lo - 2.0 * r, min=0.0)                  # (n,P)
+            denom = (L_e - 1).clamp(min=1).float()[..., None]                   # (n,P,1)
+            frac = torch.where(L_e[..., None] > 1, k_lay / denom,
+                               torch.full_like(L_e[..., None], 0.5))            # (n,P,L)
+            zc = (z_lo + r)[..., None] + span[..., None] * frac                 # (n,P,L)
+            for p in range(nP_max):
+                sl = slice(p * L_max, (p + 1) * L_max)
+                m = (k_idx < L_e[:, p:p + 1]) & (nP_e[:, None] > p)             # (n,L)
+                pos[:, sl, 0] = torch.where(m, chosen[:, p, 0:1], pos[:, sl, 0])
+                pos[:, sl, 1] = torch.where(m, chosen[:, p, 1:2], pos[:, sl, 1])
+                pos[:, sl, 2] = torch.where(m, zc[:, p, :], pos[:, sl, 2])
+                rad[:, sl] = torch.where(m, torch.full((n, L_max), r, device=dev),
+                                         rad[:, sl])
+                act[:, sl] = m
+
+            if bool(ok.all()):
+                return pos, rad, act
+            self.layout_relax_events += 1
+            last = (pos, rad, act, ok)
+        print(f"[ObstacleManager] WARN randomized layout: "
+              f"{int((~last[3]).sum())}/{n} envs unsatisfied after "
+              f"{self.layout_tries} tries (constraints already relaxed)")
+        return last[0], last[1], last[2]
 
     def _fallback_pillar_mixed(self, init_pos, goal_pos):
         """Rejection fallback guaranteeing a valid composition (looser gaps)."""
