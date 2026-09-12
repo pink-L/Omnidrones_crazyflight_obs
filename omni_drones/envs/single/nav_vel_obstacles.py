@@ -98,6 +98,13 @@ class ObstacleManager:
         self.pillar_z_hi = float(cfg.get("pillar_z_hi", 2.6))
         self.n_free_balls = int(cfg.get("n_free_obstacles", 0))
         self.pillar_ball_count = self.n_pillars * self.pillar_layers
+        # [P1 A2 2026-09-12] parking spot for INACTIVE slots (see world_pose_tensor):
+        #   ABOVE the arena (no ground-plane penetration) and spread in xy so parked
+        #   bodies never coincide. Overridable, but these defaults are the safe ones -
+        #   the old (0,0,-100) made PhysX corrupt its interaction registry and segfault.
+        self.park_x = float(cfg.get("park_x", 100.0))
+        self.park_dx = float(cfg.get("park_dx", 2.7))
+        self.park_z = float(cfg.get("park_z", 20.0))
         self.radius_choices = [float(x) for x in cfg.get("radius_choices", [0.30])]
         if self.n_pillars > 0:
             self.M = self.pillar_ball_count + self.n_free_balls
@@ -722,13 +729,35 @@ class ObstacleManager:
         self.ep_min_clearance = torch.minimum(self.ep_min_clearance, dmin)
 
     def world_pose_tensor(self, env_ids, envs_positions):
-        """(n, K, 3) world-frame positions for the view write at reset.
+        """(n, M, 3) world-frame positions for the view write at reset.
 
-        Active slots -> env-frame pos + env offset. Inactive slots are parked far
-        below the ground (z=-100) so they never collide or occlude.
+        Active slots -> env-frame pos + env offset. Inactive slots are parked far above
+        the arena, spread out in xy so they never coincide.
+
+        [P1 A2 2026-09-12] Two separate things, recorded because I got them mixed up:
+
+        1. The old spot (0, 0, -100) put the bodies 100 m *inside* the infinite default
+           ground plane, which is nonsense even for kinematic bodies. Parking above the
+           arena (park_z = 20, well clear of the drone's z <= 3 envelope and of every
+           collision test) removes that.
+        2. **It was NOT the cause of the A2 segfaults**, although it looked like it: the
+           crashes came with the PhysX "Unexpectedly unregistered an interaction that
+           does not have a valid interaction ID." error, and the only worlds that park
+           anything are the ones with M > active count, i.e. exactly the crashing ones.
+           A 2x2 bisect disproved it - `thin6` (M=24, 4 pillars x 6 layers, all 24 slots
+           active, ZERO parked) and `p6_L4` (M=24, 6 x 4, zero parked) both crashed,
+           while `deep16` (M=16, 4 coincident layers, zero parked) was stable. Parking
+           was a red herring that merely co-occurred with large M; the actual cause was
+           the PhysX GPU contact/patch pool overflowing (see cfg/base/sim_base.yaml and
+           the commit that fixed it). Verified after that fix: profiles/A2 (M=24, with
+           parked slots) trains with zero physx errors.
         """
         pos = self.pos[env_ids].clone()
-        park = (~self.active[env_ids]).unsqueeze(-1)
-        pos = torch.where(park, torch.tensor([0.0, 0.0, -100.0], device=self.device), pos)
+        park = (~self.active[env_ids]).unsqueeze(-1)                     # (n,M,1)
+        idx = torch.arange(self.M, device=self.device).float()
+        park_xyz = torch.stack([self.park_x + self.park_dx * idx,
+                                torch.zeros_like(idx),
+                                torch.full_like(idx, self.park_z)], dim=-1)   # (M,3)
+        pos = torch.where(park, park_xyz.unsqueeze(0), pos)
         pos = pos + envs_positions[env_ids].unsqueeze(1)
         return pos
