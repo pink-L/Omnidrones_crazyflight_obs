@@ -43,7 +43,12 @@ def sha256(path, chunk=1 << 20):
 
 
 def find_final(before, run_name):
-    """Newest run dir created after `before` whose config.yaml carries run_name."""
+    """Newest run dir created after `before` whose config.yaml mentions `run_name`.
+
+    NOTE: match the bare run name, not 'run_name: <name>' - wandb's dumped config.yaml
+    does not use that exact key spelling, and an exact-match version silently returned
+    nothing (v1: three A1a runs reported 'wandb=?' and 'ckpt=NONE' despite finishing).
+    """
     newest, newest_t = None, 0.0
     for d in glob.glob(os.path.join(HERE, "wandb", "run-*")):
         cfg = os.path.join(d, "files", "config.yaml")
@@ -51,7 +56,7 @@ def find_final(before, run_name):
             continue
         try:
             with open(cfg, errors="ignore") as fh:
-                if f'run_name: {run_name}' not in fh.read():
+                if run_name not in fh.read():
                     continue
         except OSError:
             continue
