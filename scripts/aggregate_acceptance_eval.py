@@ -117,7 +117,13 @@ def main():
             "rollout_steps": runs[0].get("rollout_steps"),
             "num_envs": runs[0].get("num_envs"),
             "seeds": seeds,
-            "design": "512 envs x 600 steps, deterministic MODE, fixed start->goal, "
+            # [2026-09-14] DERIVED, not hard-coded.  This used to be the literal string
+            #   "512 envs x 600 steps", which silently mislabelled every report once the
+            #   protocol changed (384 x 600 alignment / 384 x 1500 closure, plan 0.6.6).
+            #   A wrong protocol banner on a correct table is exactly the kind of error
+            #   that makes numbers non-comparable later, so read it from the run records.
+            "design": f"{runs[0].get('num_envs')} envs x {runs[0].get('rollout_steps')} "
+                      "steps, deterministic MODE, fixed start->goal, "
                       "set_seed=1000+train_seed shared by ON/OFF",
             "note": "runtime_filter=false -> CBF filter runs in SHADOW mode: a_cbf is "
                     "computed for diagnostics only, the action is passed through "
@@ -127,6 +133,17 @@ def main():
         "layout_fp": {r["_tag"]: r.get("layout_fp") for r in runs},
         "summary": {},
     }
+
+    # ---- mixed-batch guard ----------------------------------------------------
+    # Numbers from different protocols are NOT comparable (plan 0.5.16(3)), so refuse to
+    # silently average them: a mixed logdir is almost always a mistake.
+    _ne = {r.get("num_envs") for r in runs}
+    _rs = {r.get("rollout_steps") for r in runs}
+    if len(_ne) > 1 or len(_rs) > 1:
+        print(f"[aggregate] *** MIXED PROTOCOL: num_envs={sorted(_ne)} "
+              f"rollout_steps={sorted(_rs)} ***")
+        print("[aggregate] *** refusing to average across protocols; split the logdir ***")
+        raise SystemExit(2)
 
     # ---- table ---------------------------------------------------------------
     rows = []
@@ -167,19 +184,56 @@ def main():
     arr_off = m("arrival@0.2")["off_mean"]
     arr_on = m("arrival@0.2")["on_mean"]
     dep = round(arr_off / arr_on, 4) if (arr_off and arr_on) else None
+
+    # [2026-09-14] GATE REDESIGN, decided by the user after A2L3 exposed that three of the
+    # nine gates were horizon rulers rather than controller properties (plan 0.6.7):
+    #
+    # A) arrival@0.2 stays as the PASS/FAIL closure gate, but it saturates at a long horizon
+    #    (A2L3 = 0.9983 at 1500 steps vs 0.8034 at 600), so it can only coarse-screen.  The
+    #    ladder is ORDERED by the horizon-stable arrival_steps_* metrics instead.
+    # B) filter_dependency = arrival_OFF/arrival_ON is NOT a gate any more.  At 1500 steps
+    #    arrival_OFF is 0.9957, i.e. 0.0043 from saturation, so the ratio tends to 1 by
+    #    construction and the old "PASS" was vacuous.  Replaced by a SPEED-based gate.
+    # C) zero_intervention_rate = 0.6001 -> 0.8329 is purely 1 - 245/T: the ABSOLUTE
+    #    intervened step count is the same on both horizons (~245 steps), so the rate
+    #    describes the arena (how long the near-obstacle transit takes), not the controller,
+    #    and >= 0.95 is unreachable in a 6x6 m corridor by construction.  Replaced by an
+    #    absolute step budget.
+    # D) zero_collision_gate demanded 0 collisions on BOTH sides, so it FAILed at 512x600
+    #    only because the filter-OFF run hit once (ON: 0).  That single hit is evidence the
+    #    filter DOES something, so the gate now requires 0 with the filter ON and merely
+    #    records the OFF count.
+    med_on = m("arrival_steps_median")["on_mean"]
+    med_off = m("arrival_steps_median")["off_mean"]
+    speed_cost = round(med_on / med_off, 4) if (med_on and med_off) else None
+
+    _steps = int(runs[0].get("rollout_steps") or 0)
+    int_on = m("intervened_step_frac")["on_mean"]
+    int_off = m("intervened_step_frac")["off_mean"]
+    int_steps_on = round(int_on * _steps, 1) if (int_on is not None and _steps) else None
+    int_steps_off = round(int_off * _steps, 1) if (int_off is not None and _steps) else None
+
     out["gates"] = {
-        "filter_dependency_OFF_over_ON": dep,
-        "filter_dependency_gate>=0.95": None if dep is None else dep >= 0.95,
-        "zero_intervention_rate_gate>=0.95": (m("zero_intervention_rate")["on_mean"] or 0) >= 0.95
-        if m("zero_intervention_rate")["on_mean"] is not None else None,
-        "h_min_train_gate>=0": (m("h_min_train")["on_mean"] or 0) >= 0.0
-        if m("h_min_train")["on_mean"] is not None else None,
+        # --- A: closure gate (coarse) + the ordering metrics -------------------------
         "arrival@0.2_gate>=0.85": None if arr_on is None else arr_on >= 0.85,
-        "zero_collision_gate": (m("collision_envs")["on_mean"] == 0
-                                and m("collision_envs")["off_mean"] == 0),
+        "arrival_steps_median_ON/OFF": speed_cost,
+        # --- B: filter cost measured as TIME, which does not saturate ----------------
+        "filter_speed_cost_gate<=1.10": None if speed_cost is None else speed_cost <= 1.10,
+        # --- C: absolute intervention budget (horizon-free) --------------------------
+        "intervened_steps_gate<=300": None if int_steps_on is None else int_steps_on <= 300,
+        # --- D: the filter must not collide; the shadow run only needs recording -----
+        "zero_collision_ON_gate": (m("collision_envs")["on_mean"] == 0
+                                   if m("collision_envs")["on_mean"] is not None else None),
+        "collision_envs_OFF_recorded": m("collision_envs")["off_mean"],
         "zero_oob_gate": (m("oob_envs_ever")["on_mean"] == 0
                           and m("oob_envs_ever")["off_mean"] == 0),
+        "h_min_train_gate>=0": (m("h_min_train")["on_mean"] or 0) >= 0.0
+        if m("h_min_train")["on_mean"] is not None else None,
         "stall_gate<=0.10": (m("stall_frac")["on_mean"] or 0) <= 0.10,
+        # --- informational only (NOT gates) ------------------------------------------
+        "info_filter_dependency_OFF_over_ON(retired)": dep,
+        "info_zero_intervention_rate(horizon_ruler)": m("zero_intervention_rate")["on_mean"],
+        "info_intervened_steps_ON/OFF": [int_steps_on, int_steps_off],
         # [2026-09-14] NAME THE METRIC.  These used to be one entry called
         # `dropped_relevant_gate`, which conflated two different quantities:
         #   * dropped_relevant_frac      = share of *obstacles* that were relevant but
@@ -210,9 +264,15 @@ def main():
              f"   !! layout_fp MISMATCH for seeds {fp_bad} - ON/OFF not the same layout"))
     print()
     print("\n".join(lines))
-    print("\ngates (plan 4.1/4.3):")
+    print("\ngates (plan 4.1/4.3, redesigned 2026-09-14 - see plan 0.6.7):")
     for k, v in out["gates"].items():
-        if isinstance(v, bool) or v is None:
+        if k.startswith("info_"):
+            # retired / horizon-dependent quantities kept for the record only.  They must
+            # never show up as PASS/FAIL, because that is exactly how the old
+            # filter_dependency and zero_intervention_rate gates misled: both looked like
+            # real gates but were functions of the rollout length.
+            mark = "INFO"
+        elif isinstance(v, bool) or v is None:
             mark = "PASS" if v is True else ("FAIL" if v is False else "n/a")
         else:
             mark = "VALUE"
