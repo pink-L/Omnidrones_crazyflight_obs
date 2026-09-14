@@ -282,6 +282,28 @@ class ObstacleManager:
         return dmin
 
     # ---------------------------------------------------------------- obs block
+    def pillar_counts(self):
+        """(num_envs,) how many pillars currently have at least one ACTIVE slot.
+
+        DIAGNOSTIC for the A3 randomization (`n_pillars_range=[2, 8]`).  Why it is worth
+        reporting rather than policing: with route C (per-pillar obs) the number of
+        *relevant* window entries equals this count, and the remaining `K - count` entries
+        are genuinely empty space, not padding that misleads the policy.  So a low count is
+        not an error - but if the whole distribution collapses onto one value the
+        randomization has stopped varying difficulty, which IS an error.  Also the natural
+        replacement for `min_active_slots >= K` in per-pillar mode, where that bound would
+        mean "every env must have 8 pillars" and would destroy the range entirely.
+
+        Returns a float tensor so it can be mean()/min()'d uniformly.
+        """
+        if not self.pillar_random:
+            return torch.full((self.num_envs,), float(self.n_pillars),
+                              dtype=torch.float32, device=self.device)
+        L = self.pillar_layers_max
+        nb = self.n_pillars_max * L
+        return self.active[:, :nb].reshape(self.num_envs, self.n_pillars_max, L) \
+            .any(dim=-1).sum(dim=-1).float()
+
     def _pillar_groups(self):
         """(M,) slot -> group id, or None unless obstacle.obs_per_pillar is on.
 

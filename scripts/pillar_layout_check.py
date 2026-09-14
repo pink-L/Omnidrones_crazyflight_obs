@@ -158,6 +158,13 @@ def main():
     bad = 0
     worst = {"init": 1e9, "goal": 1e9, "gap": 1e9, "corridor": 1e9, "spacing": 0.0}
     conn_fail = 0
+    # [2026-09-14] A3 randomizes pillars 2-8, so report the DISTRIBUTION instead of just
+    # min/max: if it collapses onto one value the randomization has stopped varying
+    # difficulty, which is the failure mode that `min_active_slots >= K` used to guard
+    # against (and would now break, since in per-pillar mode it means "every env must have
+    # 8 pillars").  A small count is NOT an error - the empty window entries correspond to
+    # genuinely empty space.
+    pillar_cnt = []
     for s in range(a.layouts):
         init = start.unsqueeze(0).repeat(a.num_envs, 1)
         tgt = goal.unsqueeze(0).repeat(a.num_envs, 1)
@@ -167,6 +174,11 @@ def main():
         n_act = act.sum(dim=-1)
         ok_act = bool((n_act == M).all()) if not randomized else True
         act_lo, act_hi = int(n_act.min()), int(n_act.max())
+        if randomized:
+            _L = int(plr[1]) if plr is not None else L
+            _P = int(npr[1]) if npr is not None else nP
+            pillar_cnt.append(active[:, :_P * _L].reshape(a.num_envs, _P, _L)
+                              .any(dim=-1).sum(dim=-1))
 
         d_init = (init[:, None, :] - pos).norm(dim=-1) - r_s
         d_goal = (tgt[:, None, :] - pos).norm(dim=-1) - r_s
@@ -213,10 +225,21 @@ def main():
         if n_pil_c > 0 and block > 1:
             zblk = pos[:, :n_pil_c, 2].reshape(a.num_envs, n_pil_c // block, block)
             ablk = act[:, :n_pil_c].reshape(a.num_envs, n_pil_c // block, block)
-            zsort, _ = torch.sort(zblk, dim=-1)      # inactive slots carry z=0 -> sort first
+            # [2026-09-14] Sort the ACTIVITY MASK along with z.  The previous version sorted
+            #   only z and then paired `ablk[..., k] & ablk[..., k+1]`, i.e. it applied an
+            #   activity mask indexed in the ORIGINAL order to z that had been reordered.
+            #   Inactive slots carry z = 0 (they sort first), so whenever a pillar used
+            #   fewer slots than the reserved block the check measured `first_layer_z - 0`
+            #   instead of a real layer-to-layer spacing.  That produced a phantom
+            #   "1.438 x 2r HAS A GAP" for A3's [3,6] layers, which are continuous by
+            #   construction, and it means the previously published A2 number (1.443 x 2r)
+            #   was measured by the same broken rule.  Only profiles with a FIXED layer
+            #   count (A1b, A2L2, A2L3) were unaffected.
+            zsort, order = torch.sort(zblk, dim=-1)
+            asort = torch.gather(ablk, -1, order)
             best_ratio = torch.zeros(a.num_envs)
             for k in range(block - 1):
-                pair = ablk[..., k] & ablk[..., k + 1]
+                pair = asort[..., k] & asort[..., k + 1]
                 sp = zsort[..., k + 1] - zsort[..., k]
                 sp = torch.where(pair, sp, torch.zeros_like(sp))
                 best_ratio = torch.maximum(best_ratio, sp.max(dim=-1).values / (2.0 * r_pil))
@@ -249,15 +272,31 @@ def main():
             lo, hi = -3.0, 3.0
             n = int((hi - lo) / a.cell)
             xs = torch.linspace(lo + a.cell / 2, hi - a.cell / 2, n)
-            gx, gy = torch.meshgrid(xs, xs, indexing="ij")
-            pts = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1)     # (P,2)
+            # [2026-09-14] The FIRST meshgrid output must be the ROW index, and the row
+            #   index must be y: `xy_grid_bfs.idx()` returns (iy, ix) and indexes
+            #   blocked[iy, ix].  With `gx, gy = meshgrid(xs, xs)` the flat array was
+            #   ordered [x][y] while it was then indexed as [y][x], i.e. the grid was
+            #   TRANSPOSED.  That is why this checker kept reporting connectivity failures
+            #   for layouts the sampler had just certified: it was testing a mirrored world.
+            gy, gx = torch.meshgrid(xs, xs, indexing="ij")
+            pts = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1)     # (P,2) = (x,y)
             blocked = torch.zeros(pts.shape[0], dtype=torch.bool)
-            z_lo = float(oc.get("pillar_z_lo", 0.0))
-            z_hi = float(oc.get("pillar_z_hi", 0.0))
             band = (min(start[2].item(), goal[2].item()) - 0.15,
                     max(start[2].item(), goal[2].item()) + 0.15)
             for i in range(M):
-                if not bool(act[0, i]) or not (z_hi > band[0] and z_lo < band[1]):
+                if not bool(act[0, i]):
+                    continue
+                # [2026-09-14] Test the per-SLOT sphere, NOT the config's pillar_z_lo/z_hi
+                #   range.  Using the global range treated every pillar as spanning
+                #   0.4-2.6, so a pillar drawn entirely ABOVE the flight band still blocked
+                #   the corridor.  That made this checker disagree with the sampler, which
+                #   uses the discrete spheres: it reported 3/4 layouts "disconnected" that
+                #   the sampler had certified.  Only the discrete spheres exist physically,
+                #   so only they can block - and the two tools must agree or the CPU gate
+                #   certifies worlds the sampler rejects (or the reverse).
+                zc = float(pos[0, i, 2])
+                rr = float(radius[0, i])
+                if not (zc + rr > band[0] and zc - rr < band[1]):
                     continue
                 d = (pts - pos[0, i, :2]).norm(dim=-1)
                 thr = float(oc.pillar_radius) + (a.corridor_clearance or 0.0) / 2.0
@@ -290,6 +329,15 @@ def main():
           f"spacing must be <= 2r = {2.0 * float(oc.pillar_radius):.4f} m)")
     print(f"[check] failing layouts: {bad}/{a.layouts}"
           + (f", connectivity failures: {conn_fail}/{a.layouts}" if a.connectivity else ""))
+    if randomized and pillar_cnt:
+        pc = torch.cat(pillar_cnt).to(torch.int64)
+        vals, cnts = torch.unique(pc, return_counts=True)
+        dist = " ".join(f"{int(v)}:{int(c)}" for v, c in zip(vals.tolist(), cnts.tolist()))
+        print(f"[check] pillar-count distribution over {pc.numel()} envs: {dist}")
+        print(f"[check] pillar count min/mean/max = {int(pc.min())}/{float(pc.float().mean()):.2f}"
+              f"/{int(pc.max())}"
+              + ("  [WARN] the randomization is NOT varying (single value)"
+                 if int(vals.numel()) == 1 else ""))
     print("[check] " + ("PASS" if bad == 0 else "FAIL"))
     return 1 if bad else 0
 

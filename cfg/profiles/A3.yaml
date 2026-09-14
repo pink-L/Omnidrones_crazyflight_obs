@@ -1,17 +1,20 @@
 # =====================================================================
 # geometry_profile : A3
 # type             : COMPLETE frozen `task` snapshot (self-contained)
-# generated        : 2026-09-12 by scripts/make_geometry_profile.py
-# derived from     : /home/lz/lzspace/drones/OmniDrones/cfg/profiles/A2.yaml
+# generated        : 2026-09-14 by scripts/make_geometry_profile.py
+# derived from     : /home/lz/lzspace/drones/OmniDrones/cfg/profiles/A2L3.yaml
 # derivation       : COPY of the base snapshot with ONLY the following keys
 #                    changed (kept identical otherwise -> single-variable batch)
 #   obstacle.min_corridor: '<absent>' -> 1.34
 #   obstacle.n_pillars_range: '<absent>' -> [2, 8]
+#   obstacle.obs_per_pillar: '<absent>' -> True
+#   obstacle.pillar_layers_range: [3, 3] -> [3, 6]
 # NOTE: cfg/base/{env,sim}_base.yaml are INLINED on purpose -> edits to the
 #       base files can never silently change this frozen profile.
 # NOTE: no defaults list, no CLI override required.  Use as
 #       `python scripts/train.py task=<group path of this file> ...`
-# notes            : A3: per-env pillars 2-8 + corridor/connectivity criterion (fix G8/G10); only variable vs A2
+# notes            : A3 = A2L3 + per-env pillar count 2-8 + corridor gate W=1.34 + route C per-pillar obs. pillar_layers_range 3-6 keeps every pillar CONTINUOUS (L>=3 => spacing = (zspan-2r)/(L-1) <= 2r).
+# derivation       : COPY of A2L3 with ONLY obstacle.{pillar_layers_range, n_pillars_range, min_corridor, obs_per_pillar} changed
 # =====================================================================
 action_transform: velocity
 arena_bound:
@@ -101,13 +104,14 @@ obstacle:
   - 8
   num_scene: 16
   obs_dist_norm: 5
+  obs_per_pillar: true
   obs_radius_norm: 0.5
   obs_safety: none
   obs_safety_norm: 0.6
   obs_window: null
   pillar_layers: 4
   pillar_layers_range:
-  - 2
+  - 3
   - 6
   pillar_radius: 0.4243
   pillar_z_hi: 2.6
@@ -197,10 +201,6 @@ sim:
   gpu_heap_capacity: 67108864
   gpu_max_num_partitions: 8
   gpu_max_particle_contacts: 1048576
-  # [P1 A2 2026-09-12] 524288/163840 -> 2097152/2097152: PhysX GPU contact/patch pool.
-  #   The obstacle worlds stack overlapping spheres per pillar => many patches/env;
-  #   163840 (=160/env) overflowed => "Unexpectedly unregistered an interaction" +
-  #   segfault in sim.step() at M>=24.  Non-semantic (bit-exact verified); see plan 0.5.13.
   gpu_max_rigid_contact_count: 2097152
   gpu_max_rigid_patch_count: 2097152
   gpu_max_soft_body_contacts: 1048576

@@ -307,7 +307,8 @@ def main(cfg):
                 clr = obs.clearances(b.drone_state[..., :3])               # (N,M) inf=inactive
                 rel = torch.isfinite(clr) & (clr < b.obstacle_danger_radius)
                 gid = getattr(obs, "_obs_win_gid", None)
-                if gid is not None:
+                gid_full = getattr(obs, "_pillar_id", None)
+                if gid is not None and gid_full is not None:
                     # [P1 C 2026-09-14] Per-pillar window: a pillar counts as relevant when
                     # ANY of its layers is inside the danger radius, and the window holds
                     # whole pillars - so the comparison has to be per pillar as well.
@@ -316,10 +317,25 @@ def main(cfg):
                     # means.  Consequence: per-pillar and per-layer numbers are NOT
                     # comparable, so the report must say which mode produced them.
                     n_g = int(getattr(obs, "_n_groups", 0))
-                    rel_g = torch.zeros(rel.shape[0], n_g, dtype=torch.bool,
+                    # [2026-09-14] `obs._obs_win_gid` is the GROUP ID of each WINDOW slot,
+                    #   i.e. shape (N, K), while `rel` has one column per SLOT, shape
+                    #   (N, M) with M = nP_max * L_max = 48 for A3.  Scattering `rel` with
+                    #   that (N, K) index does NOT raise: torch accepts index.size(1) <=
+                    #   src.size(1) and silently uses only the FIRST K slot columns, with
+                    #   group ids used as column numbers.  That produced a meaningless
+                    #   "dropped_relevant_step_frac = 0.90" for A3 which looks exactly like
+                    #   "route C does not work" - the opposite of the truth (with one slot
+                    #   per pillar and K = n_groups nothing CAN be dropped).  Use the full
+                    #   (M,) slot -> group map for `rel_g`; only `win_g` comes from the
+                    #   window's group ids.
+                    # scatter_reduce_ with a numeric reduce op is NOT implemented for bool
+                    # on CUDA ("cuda_scatter_gather_base_kernel_func not implemented for
+                    # 'Bool'"), so reduce on a float view and threshold back.
+                    rel_g = torch.zeros(rel.shape[0], n_g, dtype=torch.float32,
                                         device=rel.device)
-                    rel_g.scatter_reduce_(1, gid.expand(rel.shape[0], -1), rel,
-                                          reduce="amax")
+                    rel_g.scatter_reduce_(1, gid_full.expand(rel.shape[0], -1),
+                                          rel.float(), reduce="amax")
+                    rel_g = rel_g > 0.5
                     win_gid = getattr(obs, "_obs_win_gid")
                     win_val = getattr(obs, "_obs_win_valid")
                     if win_val is None:                     # defensive: no window info
@@ -509,6 +525,21 @@ def main(cfg):
             rep["arrival_steps_p90"] = round(float(_v.quantile(0.9)), 1)
     except Exception as _e:                       # diagnostic only; never break the eval
         rep["arrival_steps_note"] = f"unavailable: {type(_e).__name__}"
+
+    # [2026-09-14] PILLAR-COUNT distribution.  A3 randomizes pillars 2-8, and `min_active_
+    #   slots >= K` is deliberately NOT applied there (in per-pillar obs mode that bound
+    #   would mean "every env must have 8 pillars", destroying the range).  So the risk it
+    #   used to cover - the world silently collapsing onto one difficulty - has to be
+    #   watched instead of policed, and this is where it is watched.  Reported per env over
+    #   the sampled layouts; a healthy A3 run shows a spread, not a single value.
+    try:
+        _pc = base_env.obstacles.pillar_counts().float()
+        rep["active_pillars_min"] = int(_pc.min())
+        rep["active_pillars_mean"] = round(float(_pc.mean()), 3)
+        rep["active_pillars_max"] = int(_pc.max())
+        rep["active_pillars_distinct"] = int(torch.unique(_pc).numel())
+    except Exception as _e:                       # diagnostic only
+        rep["active_pillars_note"] = f"unavailable: {type(_e).__name__}"
     rep["notarrived_step_frac"] = round(
         float(_acc.notarrived_steps.sum() / max(_acc.steps * base_env.num_envs, 1)), 4)
     rep["stall_frac"] = round(
@@ -564,7 +595,9 @@ def main(cfg):
               "corr_p50", "corr_p95", "dropped_relevant_frac",
               "dropped_relevant_step_frac", "relevant_obstacles_total",
               "arrival_steps_median", "arrival_steps_mean", "arrival_steps_p90",
-              "arrival_steps_n"):
+              "arrival_steps_n",
+              "active_pillars_min", "active_pillars_mean", "active_pillars_max",
+              "active_pillars_distinct"):
         if k in rep:
             print(f"  {k:28s} = {rep[k]}")
     print("[eval_metrics] " + json.dumps(rep, sort_keys=True), flush=True)
