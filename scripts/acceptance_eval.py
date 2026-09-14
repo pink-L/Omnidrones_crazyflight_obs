@@ -82,12 +82,18 @@ def run_one(spec, a):
     return rc, tag
 
 
+def est_peak_gib(num_envs, steps):
+    """Peak VRAM for one eval process, fitted from the two measured points
+    (512x600 -> 13.6 GiB, 512x1500 -> 26.4 GiB; plan 0.5.15/0.6.6)."""
+    return 5.1 + 2.78e-5 * float(num_envs) * float(steps)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("specs", nargs="+", help="<train_seed>:<on|off>:<ckpt_path>")
     ap.add_argument("--parallel", type=int, default=2,
-                    help="simultaneous eval processes (13.6 GiB each; use <=2 on 32 GiB)")
-    ap.add_argument("--num-envs", type=int, default=512)
+                    help="simultaneous eval processes (auto-clamped by the VRAM guard)")
+    ap.add_argument("--num-envs", type=int, default=384)
     ap.add_argument("--steps", type=int, default=600)
     ap.add_argument("--outdir", default="/tmp/navvel_eval")
     ap.add_argument("--profile", default="profiles/A0-legacy")
@@ -95,8 +101,19 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.outdir, exist_ok=True)
 
+    # VRAM guard: never let the pool exceed a 32 GiB card minus a working reserve.
+    # 384x600 (11.5 GiB x2 = 23.0) is fine; 384x1500 (21.1 GiB x2 = 42.2) is an OOM,
+    # so it is clamped to 1 with a loud warning rather than crashing.
+    peak = est_peak_gib(a.num_envs, a.steps)
+    budget = 30.0
+    fits = max(1, int(budget // peak))
+    if a.parallel > fits:
+        print(f"[acceptance] VRAM guard: {a.num_envs}x{a.steps} ~= {peak:.1f} GiB/proc, "
+              f"budget {budget:.0f} GiB -> parallel {a.parallel} -> {fits}")
+        a.parallel = fits
+
     # one worker process per spec: keeps VC/Isaac teardown isolated and lets the
-    # 2-way VRAM budget (13.6 GiB x 2) be the only concurrency limit.
+    # VRAM guard above be the only concurrency limit.
     common = ["--num-envs", str(a.num_envs), "--steps", str(a.steps),
               "--outdir", a.outdir, "--profile", a.profile, "--model-id", a.model_id]
     queue, running, worst = list(a.specs), [], 0
@@ -116,7 +133,7 @@ if __name__ == "__main__":
         argv = [x for x in sys.argv[1:] if x != "--single"]
         wap = argparse.ArgumentParser()
         wap.add_argument("spec")
-        wap.add_argument("--num-envs", type=int, default=512)
+        wap.add_argument("--num-envs", type=int, default=384)
         wap.add_argument("--steps", type=int, default=600)
         wap.add_argument("--outdir", default="/tmp/navvel_eval")
         wap.add_argument("--profile", default="profiles/A0-legacy")
