@@ -139,7 +139,10 @@ def clear_gpu(why):
             except OSError:
                 pass
         time.sleep(6)
-    return gpu_pids()
+    # Return only UNPROTECTED leftovers.  Returning every GPU pid made the caller's
+    # "GPU not released by the child" warning fire for a live sibling we deliberately
+    # kept, which is exactly the confusing false alarm this guard exists to avoid.
+    return [p for p in gpu_pids() if p not in keep]
 
 
 def run_one(seed, a):
