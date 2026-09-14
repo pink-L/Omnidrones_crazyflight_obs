@@ -178,7 +178,25 @@ def main():
         "zero_oob_gate": (m("oob_envs_ever")["on_mean"] == 0
                           and m("oob_envs_ever")["off_mean"] == 0),
         "stall_gate<=0.10": (m("stall_frac")["on_mean"] or 0) <= 0.10,
-        "dropped_relevant_gate<0.01": (m("dropped_relevant_frac")["on_mean"] or 0) < 0.01,
+        # [2026-09-14] NAME THE METRIC.  These used to be one entry called
+        # `dropped_relevant_gate`, which conflated two different quantities:
+        #   * dropped_relevant_frac      = share of *obstacles* that were relevant but
+        #                                  fell outside the K-slot obs window
+        #   * dropped_relevant_step_frac = share of *steps* that lost >=1 such obstacle
+        # On A2 (ON) they are 0.0032 vs 0.1886 - about 60x apart.  So the old gate said
+        # PASS while the plan's 3.2 escalation criterion was already exceeded, i.e. the
+        # trigger was masked by a same-prefix name.  This entry now measures exactly what
+        # its name says, and the escalation rule is reported separately below.
+        "dropped_relevant_frac_gate<0.01": (m("dropped_relevant_frac")["on_mean"] or 0) < 0.01,
+    }
+    step_on = m("dropped_relevant_step_frac")["on_mean"]
+    out["triggers"] = {
+        # plan 3.2: "若 ... dropped_relevant > 0 的步占比 > 1%，则提前升级 P4 的 K 部分"
+        "K_escalation_step_frac>0.01": (None if step_on is None else step_on > 0.01),
+        "dropped_relevant_frac_on": m("dropped_relevant_frac")["on_mean"],
+        "dropped_relevant_frac_off": m("dropped_relevant_frac")["off_mean"],
+        "dropped_relevant_step_frac_on": step_on,
+        "dropped_relevant_step_frac_off": m("dropped_relevant_step_frac")["off_mean"],
     }
 
     print(f"\n===== acceptance report: {args.label} =====")
@@ -197,6 +215,21 @@ def main():
         else:
             mark = "VALUE"
         print(f"  [{mark}] {k} = {v}")
+
+    # Output-only quantities, and the plan's escalation rule - deliberately NOT a
+    # pass/fail gate: exceeding it does not fail the batch, it demands a decision ("go
+    # raise K").  Printing it beside the gates is the whole point of the rename above.
+    trg = out["triggers"]
+    print("\ntriggers (plan 3.2 - decisions, not pass/fail):")
+    tmark = {True: "TRIGGERED", False: "not triggered", None: "n/a"}
+    esc = trg["K_escalation_step_frac>0.01"]
+    print(f"  [{tmark[esc]}] K escalation rule: dropped_relevant_step_frac(ON) = "
+          f"{trg['dropped_relevant_step_frac_on']} (threshold 0.01)")
+    print(f"  per-OBSTACLE share dropped_relevant_frac(ON/OFF)      = "
+          f"{trg['dropped_relevant_frac_on']} / {trg['dropped_relevant_frac_off']}")
+    print(f"  per-STEP share dropped_relevant_step_frac(ON/OFF)     = "
+          f"{trg['dropped_relevant_step_frac_on']} / "
+          f"{trg['dropped_relevant_step_frac_off']}")
 
     if args.out:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
