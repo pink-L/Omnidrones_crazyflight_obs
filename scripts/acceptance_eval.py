@@ -120,7 +120,8 @@ def main():
     fits = max(1, int(budget // peak))
     src = "explicit" if a.peak_gib is not None else "fitted x1.15"
     print(f"[acceptance] VRAM guard: {a.num_envs}x{a.steps} -> {peak:.1f} GiB/proc "
-          f"({src}), budget {budget:.0f} GiB -> parallel {a.parallel} -> {min(a.parallel, fits)}")
+          f"({src}), budget {budget:.0f} GiB -> parallel {a.parallel} -> {min(a.parallel, fits)}",
+          flush=True)
     if a.parallel > fits:
         a.parallel = fits
 
