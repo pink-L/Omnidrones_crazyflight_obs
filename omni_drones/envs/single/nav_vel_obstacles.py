@@ -129,17 +129,30 @@ class ObstacleManager:
         self.pillar_z_range = ([list(v) for v in _pzr] if _pzr is not None else None)
         self.min_corridor = (float(cfg["min_corridor"])
                              if cfg.get("min_corridor", None) is not None else None)
-        if self.min_corridor is not None:
-            # [P1 A3 2026-09-12] 语义澄清 + fail-fast：
-            #   走廊下界 W **不是**"柱对间距 >= W"（8 根 r_o=0.42 的柱在 6 m 场地里
-            #   根本做不到：需要的中心距 = 2r+W = 2.19 m），而是"存在一条起点→终点、
-            #   瓶颈净宽 >= W 的通路"。后者必须在采样后做**阈值化连通性校验**（栅格 BFS，
-            #   阻挡判据 = ‖xy-p_i‖ < r_o + W/2）并在失败时重采/减柱。
-            #   该门禁尚未实现 ⇒ 先拒绝构造，避免"带着未验证世界开训"。
-            raise NotImplementedError(
-                "obstacle.min_corridor (A3 corridor/connectivity gate) is not implemented "
-                "yet: it must be a bottleneck-connectivity check, not a pairwise pillar "
-                "spacing floor. See plan 3.2 (G8/G10). Remove the key to sample without it.")
+        # [P1 A3 2026-09-14] Bottleneck-connectivity gate - IMPLEMENTED (was fail-fast).
+        #   Semantics: W is NOT "a pillar pair must be >= W apart".  Eight pillars of
+        #   r_o = 0.42 in a 6 m arena cannot satisfy that at all (it would need a centre
+        #   spacing of 2r + W = 2.19 m).  W means: "there must exist a path from start to
+        #   goal whose bottleneck clear width is >= W".  That is a property of the WHOLE
+        #   layout, so it is a thresholded connectivity test, not a spacing floor:
+        #   block every grid cell within `pillar_radius + W/2` of a pillar that overlaps
+        #   the flight altitude band, then require start and goal to be in the same free
+        #   component.
+        #   Deliberately the SAME criterion as `scripts/pillar_layout_check.py
+        #   --connectivity --corridor-clearance W`, so the CPU gate and the sampler can
+        #   never disagree.  It is a conservative 2-D projection (a pillar that spans the
+        #   band blocks horizontal passage even if a 3-D path might squeeze past), which is
+        #   the safe direction to be wrong in.
+        self.corridor_cell = float(cfg.get("corridor_cell", 0.05))
+        self.corridor_extent = float(cfg.get("corridor_extent", 3.0))
+        self.corridor_band_pad = float(cfg.get("corridor_band_pad", 0.15))
+        # How many per-env redraws to attempt for the connectivity gate.  Higher than
+        # layout_tries because connectivity is a per-env property whose failure rate can be
+        # tens of percent (measured: 39.6% of A3's layouts at W=1.34), so a full batch needs
+        # enough rounds for 0.4^k * num_envs to fall below 1 (~8 rounds at 1024 envs).
+        self.corridor_tries = int(cfg.get("corridor_tries", 15))
+        self.corridor_reject_events = 0
+        self.corridor_reject_envs = 0
         self.layout_tries = int(cfg.get("layout_tries", 6))
         # [P1 A3 2026-09-14] Minimum number of ACTIVE slots per env.  Rationale: when
         #   M > K the obs window keeps the nearest K slots and `clearances()` masks unused
@@ -153,6 +166,15 @@ class ObstacleManager:
         self.pillar_random = any(x is not None for x in
                                  (self.n_pillars_range, self.pillar_layers_range,
                                   self.pillar_z_range))
+        if self.min_corridor is not None and not self.pillar_random:
+            # The corridor check needs the per-env drawn layout, so it only exists on the
+            # randomized path.  Refuse loudly rather than silently sampling a world whose
+            # connectivity was never verified - "train on an unverified world" is exactly
+            # what the old fail-fast was protecting against.
+            raise NotImplementedError(
+                "obstacle.min_corridor is implemented only for the RANDOMIZED pillar path "
+                "(set n_pillars_range / pillar_layers_range / pillar_z_range). The uniform "
+                "path (_sample_pillar_mixed) has no connectivity gate; see plan 3.2.")
         self.layout_relax_events = 0
         if self.pillar_random:
             self.n_pillars_max = (int(self.n_pillars_range[1]) if self.n_pillars_range
@@ -592,7 +614,125 @@ class ObstacleManager:
         return pos, rad, active
 
     # ------------------------------------------------- [P1 A2/A3] 随机化柱布局
+    def _corridor_connected(self, pos, rad, act, init_pos, goal_pos):
+        """Per-env bottleneck-connectivity test for the A3 corridor gate (plan 3.2).
+
+        `min_corridor = W` means "there must exist a start -> goal path whose bottleneck
+        clear width is >= W".  Implemented as: rasterise the flight band onto a 2-D grid,
+        block every cell within `pillar_radius + W/2` of a sphere that overlaps the band,
+        then require start and goal to lie in the same free connected component.
+
+        Same criterion as `scripts/pillar_layout_check.py --connectivity
+        --corridor-clearance W` (cell 0.05, extent [-3, 3], band pad 0.15) ON PURPOSE, so
+        the CPU gate and the sampler cannot disagree about what W means.
+
+        Returns a bool tensor (n,): True where a W-wide corridor exists.
+        """
+        import numpy as _np
+        try:
+            from scipy import ndimage as _ndi
+        except Exception:                       # pragma: no cover - scipy is a hard dep
+            raise RuntimeError("min_corridor needs scipy.ndimage for the connectivity test")
+
+        n = pos.shape[0]
+        W = float(self.min_corridor)
+        cell = self.corridor_cell
+        ext = self.corridor_extent
+        nc = int(round((2.0 * ext) / cell))
+
+        init = init_pos.reshape(n, 3)
+        goal = goal_pos.reshape(n, 3)
+        # Flight band: the drone only needs a horizontal corridor between the start and
+        # goal ALTITUDES (+ pad).  A sphere that never enters the band cannot block it -
+        # the drone flies under/over it.  This is what makes the gate 3-D-aware.
+        b_lo = torch.minimum(init[:, 2], goal[:, 2]) - self.corridor_band_pad
+        b_hi = torch.maximum(init[:, 2], goal[:, 2]) + self.corridor_band_pad
+
+        # Offsets of the grid-cell centres, centred on the ORIGIN, so the same grid works
+        # for every env (pillar centres are already expressed in the env frame).
+        half = 0.5 * (nc - 1) * cell
+        ax = (torch.arange(nc, device=pos.device, dtype=pos.dtype) * cell) - half
+
+        # Which slots overlap the band and are active?  (n, M) -> only those can block.
+        zc = pos[..., 2]                                    # (n,M)
+        in_band = act & (zc + rad > b_lo[:, None]) & (zc - rad < b_hi[:, None])
+
+        thr = self.pillar_radius + 0.5 * W
+        thr2 = thr * thr
+
+        out = torch.zeros(n, dtype=torch.bool, device=pos.device)
+        for e in range(n):
+            sel = torch.nonzero(in_band[e], as_tuple=False).reshape(-1)
+            blocked = _np.zeros((nc, nc), dtype=bool)
+            if sel.numel() > 0:
+                cx = pos[e, sel, 0]
+                cy = pos[e, sel, 1]
+                # Vectorised: (S, nc, nc) distance^2, reduced with OR over slots.
+                dx = ax[None, None, :] - cx[:, None, None]
+                dy = ax[None, :, None] - cy[:, None, None]
+                blocked = (dx * dx + dy * dy < thr2).any(dim=0).cpu().numpy()
+
+            def _rc(p):
+                i = int(round((float(p[1]) + half) / cell))
+                j = int(round((float(p[0]) + half) / cell))
+                return (0 <= i < nc and 0 <= j < nc), i, j
+
+            si_ok, si, sj = _rc(init[e])
+            gi_ok, gi, gj = _rc(goal[e])
+            if not (si_ok and gi_ok):
+                continue                        # start/goal outside the grid: cannot certify
+            if blocked[si, sj] or blocked[gi, gj]:
+                continue                        # start or goal itself is inside a blocked cell
+            # Label the FREE space, not the blocked space.  scipy.ndimage.label marks the
+            # True cells as components and everything False as background 0, so feeding it
+            # `blocked` makes every free cell (start and goal included) label 0 and the
+            # test would answer False for EVERY layout - which is exactly the bug this
+            # comment is here to prevent: an always-rejecting gate looks like a very
+            # strict gate rather than a broken one.
+            lab, _ = _ndi.label(~blocked, structure=_np.array(
+                [[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool))
+            out[e] = bool(lab[si, sj] != 0 and lab[si, sj] == lab[gi, gj])
+        return out
+
     def _sample_pillar_random(self, init_pos, goal_pos):
+        """Randomised pillar layout + the A3 bottleneck-connectivity gate.
+
+        WHY A WRAPPER.  Inactive/geometric constraints (spawn & goal clearance, pillar
+        spacing) are satisfied by almost every draw, so `_sample_pillar_random_once`'s
+        "retry until ok.all()" loop works for them.  Connectivity is NOT like that: its
+        per-env failure rate is tens of percent (measured 39.6% for A3 at W=1.34), so
+        demanding that all 1024 envs succeed in the SAME attempt is hopeless
+        (0.60^1024 ~ 0) and the loop would always exhaust its tries and return
+        disconnected worlds.  Rejection therefore has to be PER-ENV and STICKY: freeze the
+        envs that already have a corridor and redraw only the ones that do not.
+
+        When `min_corridor is None` this calls `_sample_pillar_random_once` exactly once and
+        returns, so the frozen profiles (A0/A/A1a/A1b/A2/A2L2/A2L3/A2P) consume the RNG in
+        exactly the same order as before - verified bit-exact against git HEAD.
+        """
+        pos, rad, act = self._sample_pillar_random_once(init_pos, goal_pos)
+        if self.min_corridor is None:
+            return pos, rad, act
+
+        conn = self._corridor_connected(pos, rad, act, init_pos, goal_pos)
+        for _ in range(max(self.corridor_tries, 0)):
+            bad = ~conn
+            if not bool(bad.any()):
+                break
+            self.corridor_reject_events += 1
+            self.corridor_reject_envs += int(bad.sum())
+            pos[bad], rad[bad], act[bad] = self._sample_pillar_random_once(
+                init_pos[bad], goal_pos[bad])
+            conn[bad] = self._corridor_connected(
+                pos[bad], rad[bad], act[bad], init_pos[bad], goal_pos[bad])
+        if not bool(conn.all()):
+            print(f"[ObstacleManager] WARN corridor gate: {int((~conn).sum())}/"
+                  f"{pos.shape[0]} envs still have no W={self.min_corridor} m corridor "
+                  f"after {self.corridor_tries} redraws; these envs need the CPU gate "
+                  f"(scripts/pillar_layout_check.py --connectivity) to be checked")
+        return pos, rad, act
+
+    def _sample_pillar_random_once(self, init_pos, goal_pos):
         """Randomised pillar layout: per-env pillar count / per-pillar layer count and
         z-span (A2), optional pillar-to-pillar corridor lower bound and spawn/goal
         clearance relaxation with retries (A3).
@@ -635,9 +775,12 @@ class ObstacleManager:
         last = None
         for attempt in range(max(self.layout_tries, 1)):
             relax = 0.9 ** attempt            # 0.9^0 = 1.0 -> 首次完全不放松
-            # NOTE: min_corridor is deliberately NOT used here - a corridor requirement is
-            # a bottleneck-connectivity property of the whole layout, not a pairwise
-            # pillar spacing floor (see __init__).
+            # NOTE: min_corridor is NOT a spacing floor applied here.  It is a bottleneck
+            # connectivity property of the WHOLE layout, so it is tested after the layout
+            # is built, near the end of this loop (`_corridor_connected`), and folded into
+            # the same `ok` mask so `layout_tries` retries it.  Using it as a pairwise
+            # pillar-to-pillar gap here would be wrong: 8 pillars of r_o=0.42 in a 6 m
+            # arena would need a 2.19 m centre spacing and no layout could ever satisfy it.
             need_gap = 2.0 * r + self.min_gap_between
             v_init = self.init_clearance * relax
             v_goal = self.goal_clearance * relax
@@ -710,6 +853,8 @@ class ObstacleManager:
                         f"min_active_slots={self.min_active_slots} not satisfied: "
                         f"minimum realised active slots = {int(act.sum(dim=-1).min())}")
 
+            # NOTE: the A3 corridor gate is NOT applied here - see the wrapper
+            # `_sample_pillar_random`, which enforces it per-env after this returns.
             if bool(ok.all()):
                 return pos, rad, act
             self.layout_relax_events += 1
