@@ -306,7 +306,35 @@ def main(cfg):
             if idx is not None:
                 clr = obs.clearances(b.drone_state[..., :3])               # (N,M) inf=inactive
                 rel = torch.isfinite(clr) & (clr < b.obstacle_danger_radius)
-                if rel.any():
+                gid = getattr(obs, "_obs_win_gid", None)
+                if gid is not None:
+                    # [P1 C 2026-09-14] Per-pillar window: a pillar counts as relevant when
+                    # ANY of its layers is inside the danger radius, and the window holds
+                    # whole pillars - so the comparison has to be per pillar as well.
+                    # Reusing the per-layer formula here would report the *other* layers of
+                    # an already-visible pillar as "dropped", which is not what this metric
+                    # means.  Consequence: per-pillar and per-layer numbers are NOT
+                    # comparable, so the report must say which mode produced them.
+                    n_g = int(getattr(obs, "_n_groups", 0))
+                    rel_g = torch.zeros(rel.shape[0], n_g, dtype=torch.bool,
+                                        device=rel.device)
+                    rel_g.scatter_reduce_(1, gid.expand(rel.shape[0], -1), rel,
+                                          reduce="amax")
+                    win_gid = getattr(obs, "_obs_win_gid")
+                    win_val = getattr(obs, "_obs_win_valid")
+                    if win_val is None:                     # defensive: no window info
+                        win_val = torch.ones_like(win_gid, dtype=torch.bool)
+                    # max-combine so an invalid (padded) column can never erase a valid
+                    # one, and clamp because padded columns carry arbitrary group ids
+                    wf = torch.zeros_like(rel_g, dtype=torch.float32)
+                    wf.scatter_reduce_(1, win_gid.clamp(min=0, max=n_g - 1),
+                                       win_val.float(), reduce="amax")
+                    win_g = wf > 0.5
+                    dropped = rel_g & ~win_g
+                    self.dr_relevant += float(rel_g.sum())
+                    self.dr_dropped += float(dropped.sum())
+                    self.dr_steps += float(dropped.any())
+                elif rel.any():
                     win = torch.zeros_like(rel)
                     win.scatter_(1, idx.clamp(min=0),
                                  torch.ones_like(idx, dtype=torch.bool))

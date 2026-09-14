@@ -185,6 +185,21 @@ class ObstacleManager:
         self.relax = float(cfg.get("spawn_relax", 0.85))
         self.relax_rounds = int(cfg.get("spawn_relax_rounds", 6))
         self.obs_dist_norm = float(cfg.get("obs_dist_norm", 5.0))
+        # [P1 C 2026-09-14] per-pillar observation = one obs slot per OBSTACLE (a whole
+        #   pillar, collapsed to its nearest layer) instead of one slot per LAYER.
+        #   WHY: the window topk's over SLOTS = spheres = layers, so a single 6-layer
+        #   pillar can eat 6 of the 8 window slots.  That is what pushed A2's
+        #   dropped_relevant_step_frac to 18.86% and made the K budget look exhausted
+        #   even though the world holds only 4-8 pillars.  Collapsing to one slot per
+        #   pillar makes the obs requirement depend on the PILLAR count alone, so K=8
+        #   covers A3's 2-8 pillars exactly, with no obs-dimension change (still 4*K) and
+        #   no red line.  The CBF/physics/reward paths are untouched: the CBF ball channel
+        #   is fed ALL M slots independently of this window (see nav_vel.py).
+        #   Default False -> the frozen A0/A/A1a/A1b/A2/A2L2/A2L3 worlds are bit-identical.
+        self.obs_per_pillar = bool(cfg.get("obs_per_pillar", False))
+        self._pillar_id = None
+        self._n_groups = 0
+        self._obs_win_gid = None
         self.obs_radius_norm = float(cfg.get("obs_radius_norm", 0.5))
 
         # spawn box (env frame)
@@ -245,6 +260,61 @@ class ObstacleManager:
         return dmin
 
     # ---------------------------------------------------------------- obs block
+    def _pillar_groups(self):
+        """(M,) slot -> group id, or None unless obstacle.obs_per_pillar is on.
+
+        A group is one obstacle AS A WHOLE: all the layers of one pillar, or a single free
+        ball.  The mapping is static, so it is built once and cached.
+        """
+        if not self.obs_per_pillar or self.M <= self.K:
+            return None
+        if self._pillar_id is None:
+            dev = self.device
+            L = max(int(self.pillar_layers_max if self.pillar_random
+                        else self.pillar_layers), 1)
+            ids = torch.arange(self.M, device=dev) // L
+            if self.pillar_random:
+                # randomised path: slot p owns the fixed block [p*L_max, (p+1)*L_max)
+                n_g = int(self.n_pillars_max)
+            else:
+                if self.n_free_balls > 0:
+                    ids[self.pillar_ball_count:] = self.n_pillars + torch.arange(
+                        self.M - self.pillar_ball_count, device=dev)
+                n_g = int(self.n_pillars) + int(self.n_free_balls)
+            self._pillar_id, self._n_groups = ids, n_g
+            print(f"[ObstacleManager] obs_per_pillar ON: M={self.M} slots -> "
+                  f"{n_g} groups (K={self.K})")
+        return self._pillar_id
+
+    def _window_per_pillar(self, d):
+        """Nearest-K window over PILLARS instead of over slots (route C variant (a)).
+
+        Steps: collapse each pillar to its nearest layer -> take the nearest K pillars ->
+        report that representative layer's 4 features.  The feature meaning and the
+        4*K dimension are unchanged; only *which* slot gets selected differs, so the
+        policy stops wasting window slots on extra layers of a pillar it already sees.
+
+        Sets self._obs_win_gid (the chosen group per window slot) so the eval-side
+        dropped_relevant diagnostic can be computed on the same per-pillar basis.
+        """
+        gid, n_g = self._pillar_id, self._n_groups
+        n = d.shape[0]
+        d_g = torch.full((n, n_g), float("inf"), device=d.device)
+        d_g.scatter_reduce_(1, gid.expand(n, -1), d, reduce="amin")
+        if n_g < self.K:                      # pad so topk always yields K columns
+            d_g = torch.cat([d_g, torch.full((n, self.K - n_g), float("inf"),
+                                             device=d.device)], dim=-1)
+        vals, idx_g = torch.topk(d_g, k=self.K, dim=-1, largest=False)
+        self._obs_win_gid = idx_g
+        # Map each chosen group back to the slot that realises its minimum.  Both masks
+        # are needed: `belongs` keeps the slot in the chosen group (a padded column
+        # matches nothing, so its `valid` stays False via the inf in `vals`), and
+        # `realises` picks the nearest layer of that pillar.
+        belongs = gid[None, None, :] == idx_g.unsqueeze(-1)      # (N,K,M)
+        realises = d.unsqueeze(1) == vals.unsqueeze(-1)          # (N,K,M)
+        idx = (belongs & realises).float().argmax(dim=-1)        # (N,K) representative
+        return vals, idx
+
     def build_obs(self, drone_pos):
         """(N, 1, K*4) normalized obstacle block for the policy.
 
@@ -259,7 +329,12 @@ class ObstacleManager:
             # 选最近 K 个激活障碍（升序）；不足 K 个时剩余槽补零
             d = torch.norm(self.pos - drone_pos, dim=-1)              # (N,M)
             d = torch.where(self.active, d, torch.full_like(d, float("inf")))
-            vals, idx = torch.topk(d, k=self.K, dim=-1, largest=False)  # (N,K)
+            self._obs_win_gid = None
+            if self._pillar_groups() is not None:
+                # route C: one window slot per PILLAR (see _window_per_pillar)
+                vals, idx = self._window_per_pillar(d)
+            else:
+                vals, idx = torch.topk(d, k=self.K, dim=-1, largest=False)  # (N,K)
             valid = torch.isfinite(vals)                              # (N,K)
             # [K5 2026-09-12] 暴露本步的窗口选择, 供 eval 统计 dropped_relevant
             #   (危险区障碍被挤出 obs 窗口 => 策略"看不见"却会被判撞). 纯诊断, 训练不使用.
