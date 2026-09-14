@@ -274,6 +274,16 @@ def main():
             mark = "INFO"
         elif isinstance(v, bool) or v is None:
             mark = "PASS" if v is True else ("FAIL" if v is False else "n/a")
+            # [2026-09-14] The speed-cost metric is horizon-stable but not horizon-EXACT:
+            # measured drift between 600 and 1500 steps is +0.0022 (A2L3) to +0.0092 (A1a),
+            # i.e. up to 0.9%.  With the threshold at 1.10 that puts A1a INSIDE the drift
+            # band (1.0991 at 600 vs 1.1083 at 1500 -> PASS at one horizon, FAIL at the
+            # other).  A verdict that flips with the protocol is not a verdict, so anything
+            # within 1% of the threshold is reported as WARN (needs a margin decision)
+            # instead of being silently resolved one way.
+            if k.startswith("filter_speed_cost") and speed_cost is not None \
+                    and abs(speed_cost - 1.10) <= 0.01:
+                mark = "WARN"
         else:
             mark = "VALUE"
         print(f"  [{mark}] {k} = {v}")
