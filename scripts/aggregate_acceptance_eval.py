@@ -217,8 +217,15 @@ def main():
         # --- A: closure gate (coarse) + the ordering metrics -------------------------
         "arrival@0.2_gate>=0.85": None if arr_on is None else arr_on >= 0.85,
         "arrival_steps_median_ON/OFF": speed_cost,
-        # --- B: filter cost measured as TIME, which does not saturate ----------------
-        "filter_speed_cost_gate<=1.10": None if speed_cost is None else speed_cost <= 1.10,
+        # --- B: filter cost, RECORD-ONLY (user decision 2026-09-14 20:0x) ------------
+        # The metric is nearly horizon-stable but not exactly: drift is +0.0022 (A2L3) to
+        # +0.0092 (A1a), so a hard threshold at 1.10 flips A1a's verdict between protocols
+        # (1.0991 at 600 PASS vs 1.1083 at 1500 FAIL).  A verdict that flips with the
+        # protocol is not a verdict, so this is a monitor, not a gate.  The reason it is
+        # not promoted even with margin: at 1500 steps arrival_OFF is already 0.983-0.996,
+        # i.e. the filter barely affects the ARRIVAL RATE any more - its real value shows up
+        # in COLLISIONS, and the collision gate below carries that dimension.
+        "info_filter_speed_cost_on_over_off(warn>1.10)": speed_cost,
         # --- C: absolute intervention budget (horizon-free) --------------------------
         "intervened_steps_gate<=300": None if int_steps_on is None else int_steps_on <= 300,
         # --- D: the filter must not collide; the shadow run only needs recording -----
@@ -265,6 +272,7 @@ def main():
     print()
     print("\n".join(lines))
     print("\ngates (plan 4.1/4.3, redesigned 2026-09-14 - see plan 0.6.7):")
+    _warn = []
     for k, v in out["gates"].items():
         if k.startswith("info_"):
             # retired / horizon-dependent quantities kept for the record only.  They must
@@ -272,21 +280,20 @@ def main():
             # filter_dependency and zero_intervention_rate gates misled: both looked like
             # real gates but were functions of the rollout length.
             mark = "INFO"
+            # [2026-09-14] The speed-cost metric is horizon-stable but not horizon-EXACT:
+            # drift between 600 and 1500 steps is +0.0022 (A2L3) to +0.0092 (A1a), up to
+            # 0.9%.  It is record-only (see the comment on the gate dict), but exceeding
+            # 1.10 still deserves a warning that accumulates for the margin decision.
+            if "filter_speed_cost" in k and isinstance(v, float) and v > 1.10:
+                _warn.append(f"`filter_speed_cost` = {v} > 1.10 (record-only; needs a "
+                             "margin decision before it can gate)")
         elif isinstance(v, bool) or v is None:
             mark = "PASS" if v is True else ("FAIL" if v is False else "n/a")
-            # [2026-09-14] The speed-cost metric is horizon-stable but not horizon-EXACT:
-            # measured drift between 600 and 1500 steps is +0.0022 (A2L3) to +0.0092 (A1a),
-            # i.e. up to 0.9%.  With the threshold at 1.10 that puts A1a INSIDE the drift
-            # band (1.0991 at 600 vs 1.1083 at 1500 -> PASS at one horizon, FAIL at the
-            # other).  A verdict that flips with the protocol is not a verdict, so anything
-            # within 1% of the threshold is reported as WARN (needs a margin decision)
-            # instead of being silently resolved one way.
-            if k.startswith("filter_speed_cost") and speed_cost is not None \
-                    and abs(speed_cost - 1.10) <= 0.01:
-                mark = "WARN"
         else:
             mark = "VALUE"
         print(f"  [{mark}] {k} = {v}")
+    for w in _warn:
+        print(f"  [WARN] {w}")
 
     # Output-only quantities, and the plan's escalation rule - deliberately NOT a
     # pass/fail gate: exceeding it does not fail the batch, it demands a decision ("go
