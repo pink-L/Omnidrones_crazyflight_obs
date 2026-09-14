@@ -82,10 +82,18 @@ def run_one(spec, a):
     return rc, tag
 
 
-def est_peak_gib(num_envs, steps):
-    """Peak VRAM for one eval process, fitted from the two measured points
-    (512x600 -> 13.6 GiB, 512x1500 -> 26.4 GiB; plan 0.5.15/0.6.6)."""
-    return 5.1 + 2.78e-5 * float(num_envs) * float(steps)
+def est_peak_gib(num_envs, steps, safety=True):
+    """Peak VRAM for one eval process, fitted from two measured points
+    (512x600 -> 13.6 GiB, 512x1500 -> 26.4 GiB; plan 0.5.15/0.6.6).
+
+    [2026-09-14] `safety` applies a 1.15 factor.  The raw fit is NOT conservative enough:
+    both calibration points came from M=16/24 worlds, and A3 (M=48) OOM'd at --parallel 2
+    on a 512x600 run after each process reached 14.10 GiB (67 MiB free on a 31.36 GiB card),
+    i.e. the per-process peak grows with the obstacle count.  The factor covers that
+    overshoot; pass `--peak-gib` explicitly when a profile is known to be heavier still.
+    """
+    base = 5.1 + 2.78e-5 * float(num_envs) * float(steps)
+    return base * 1.15 if safety else base
 
 
 def main():
@@ -98,18 +106,22 @@ def main():
     ap.add_argument("--outdir", default="/tmp/navvel_eval")
     ap.add_argument("--profile", default="profiles/A0-legacy")
     ap.add_argument("--model-id", default="navvel-cfb-v1.0.0-dual-p1-s11")
+    ap.add_argument("--peak-gib", type=float, default=None,
+                    help="override the per-process VRAM estimate (GiB) instead of using "
+                         "the fitted curve; use it for profiles heavier than M=24")
     a = ap.parse_args()
     os.makedirs(a.outdir, exist_ok=True)
 
-    # VRAM guard: never let the pool exceed a 32 GiB card minus a working reserve.
-    # 384x600 (11.5 GiB x2 = 23.0) is fine; 384x1500 (21.1 GiB x2 = 42.2) is an OOM,
-    # so it is clamped to 1 with a loud warning rather than crashing.
-    peak = est_peak_gib(a.num_envs, a.steps)
+    # VRAM guard: never let the pool exceed a 32 GiB card minus a working reserve.  The
+    # decision is printed ALWAYS - printing it only when it clamps is how the wrong
+    # 13.6 GiB assumption stayed invisible while 2 x 14.1 GiB was busy OOM-ing.
+    peak = a.peak_gib if a.peak_gib is not None else est_peak_gib(a.num_envs, a.steps)
     budget = 30.0
     fits = max(1, int(budget // peak))
+    src = "explicit" if a.peak_gib is not None else "fitted x1.15"
+    print(f"[acceptance] VRAM guard: {a.num_envs}x{a.steps} -> {peak:.1f} GiB/proc "
+          f"({src}), budget {budget:.0f} GiB -> parallel {a.parallel} -> {min(a.parallel, fits)}")
     if a.parallel > fits:
-        print(f"[acceptance] VRAM guard: {a.num_envs}x{a.steps} ~= {peak:.1f} GiB/proc, "
-              f"budget {budget:.0f} GiB -> parallel {a.parallel} -> {fits}")
         a.parallel = fits
 
     # one worker process per spec: keeps VC/Isaac teardown isolated and lets the
