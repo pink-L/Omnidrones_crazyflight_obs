@@ -106,6 +106,11 @@ def main():
                          "connectivity (A3 criterion)")
     ap.add_argument("--connectivity", action="store_true", help="2-D grid BFS start->goal")
     ap.add_argument("--cell", type=float, default=0.05)
+    ap.add_argument("--allow-discontinuous", action="store_true",
+                    help="do not fail when a pillar's layers are spaced further apart "
+                         "than 2*r (i.e. the 'pillar' has a vertical gap and is really "
+                         "a stack of floating balls). Frozen legacy profiles A2/A2L2 "
+                         "need this; new profiles should not.")
     a = ap.parse_args()
 
     task = OmegaConf.load(_resolve_profile(a.profile))
@@ -151,7 +156,7 @@ def main():
               f"for the 'drone centre' variant)")
 
     bad = 0
-    worst = {"init": 1e9, "goal": 1e9, "gap": 1e9, "corridor": 1e9}
+    worst = {"init": 1e9, "goal": 1e9, "gap": 1e9, "corridor": 1e9, "spacing": 0.0}
     conn_fail = 0
     for s in range(a.layouts):
         init = start.unsqueeze(0).repeat(a.num_envs, 1)
@@ -196,6 +201,27 @@ def main():
         mc_gap = float(gap.min())
         mc_corr = float(pil_gap.min())
 
+        # [2026-09-14] Pillar CONTINUITY.  A pillar is a stack of spheres, so it only reads
+        #   as ONE column when adjacent layers overlap: spacing <= 2*r.  With sparse layers
+        #   the column has a vertical gap and the drone can fly *through* the "pillar", i.e.
+        #   the world is a stack-of-floating-balls world, not a pillar world (A2L2 at L=2
+        #   left a 0-0.5 m gap; the minimum legal L is (z_hi-z_lo)/(2r), which is 3 for the
+        #   worst A2 z-span).  Layouts are drawn per env, so this is checked per env.
+        r_pil = float(oc.pillar_radius)
+        n_pil_c = nP_max * L_max if randomized else nP * L
+        spacing_ratio = 0.0
+        if n_pil_c > 0 and block > 1:
+            zblk = pos[:, :n_pil_c, 2].reshape(a.num_envs, n_pil_c // block, block)
+            ablk = act[:, :n_pil_c].reshape(a.num_envs, n_pil_c // block, block)
+            zsort, _ = torch.sort(zblk, dim=-1)      # inactive slots carry z=0 -> sort first
+            best_ratio = torch.zeros(a.num_envs)
+            for k in range(block - 1):
+                pair = ablk[..., k] & ablk[..., k + 1]
+                sp = zsort[..., k + 1] - zsort[..., k]
+                sp = torch.where(pair, sp, torch.zeros_like(sp))
+                best_ratio = torch.maximum(best_ratio, sp.max(dim=-1).values / (2.0 * r_pil))
+            spacing_ratio = float(best_ratio.max())
+
         probs = []
         if not ok_act:
             probs.append(f"active={int(n_act[0])}!={M}")
@@ -213,6 +239,10 @@ def main():
             probs.append(f"goal_clr {mc_goal:.4f} < {mgr.goal_clearance}")
         if mc_gap < mgr.min_gap_between - 1e-6:
             probs.append(f"gap {mc_gap:.4f} < {mgr.min_gap_between}")
+        if spacing_ratio > 1.0 + 1e-6 and not a.allow_discontinuous:
+            probs.append(f"pillar has a vertical gap: worst layer spacing = "
+                         f"{spacing_ratio:.3f} x 2r (must be <= 1.0; see --allow-"
+                         f"discontinuous)")
 
         conn = None
         if a.connectivity:
@@ -241,6 +271,7 @@ def main():
         for k, v in (("init", mc_init), ("goal", mc_goal), ("gap", mc_gap),
                      ("corridor", mc_corr)):
             worst[k] = min(worst[k], v)
+        worst["spacing"] = max(worst["spacing"], spacing_ratio)
         if probs:
             bad += 1
             print(f"  layout {s}: FAIL -> {', '.join(probs)}")
@@ -253,6 +284,10 @@ def main():
     print(f"\n[check] worst over {a.layouts} layouts x {a.num_envs} envs: "
           f"init_clr={worst['init']:.4f} goal_clr={worst['goal']:.4f} "
           f"gap={worst['gap']:.4f} corridor={worst['corridor']:.4f}")
+    print(f"[check] pillar continuity: worst adjacent-layer spacing = "
+          f"{worst['spacing']:.3f} x 2r "
+          f"({'CONTINUOUS' if worst['spacing'] <= 1.0 + 1e-6 else 'HAS A GAP'}; "
+          f"spacing must be <= 2r = {2.0 * float(oc.pillar_radius):.4f} m)")
     print(f"[check] failing layouts: {bad}/{a.layouts}"
           + (f", connectivity failures: {conn_fail}/{a.layouts}" if a.connectivity else ""))
     print("[check] " + ("PASS" if bad == 0 else "FAIL"))
