@@ -28,6 +28,8 @@ METRIC_ORDER = [
     "zero_intervention_rate", "intervened_step_frac", "corr_mean", "corr_p50",
     "corr_p95", "stall_frac", "dropped_relevant_frac",
     "dropped_relevant_step_frac",
+    # [2026-09-14] horizon-independent speed metric (see eval_ckpt.py)
+    "arrival_steps_median", "arrival_steps_mean", "arrival_steps_p90",
 ]
 
 

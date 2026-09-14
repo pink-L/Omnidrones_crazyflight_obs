@@ -490,6 +490,25 @@ def main(cfg):
     }
     rep["arrival_at"] = {f"{r:g}": round(float(_acc.arrived[r].float().mean()), 4)
                          for r in ARR_RADII}
+    # [2026-09-14] HORIZON-INDEPENDENT speed metric.  arrival@0.2 saturates as soon as the
+    #   rollout covers a whole episode - measured on ONE checkpoint with everything else
+    #   fixed: 0.7943 at 600 steps, 0.9635 at 900, 0.9974 at 1500 - so a time-boxed rate
+    #   cannot discriminate rungs at a long horizon (and corr_mean/corr_p95 drift down with
+    #   the horizon too).  The env already records, per env, the progress_buf step of the
+    #   first arrival inside a window (nav_vel `stats["first_arrival_step"]`, 0 = never
+    #   arrived).  Being episode-relative, it does not depend on the rollout length, so its
+    #   median/p90 over the envs that DID arrive is the quantity that stays comparable.
+    try:
+        _fas = base_env.stats["first_arrival_step"].reshape(-1)
+        _ok = _fas > 0
+        rep["arrival_steps_n"] = int(_ok.sum())
+        if bool(_ok.any()):
+            _v = _fas[_ok].float()
+            rep["arrival_steps_median"] = round(float(_v.median()), 1)
+            rep["arrival_steps_mean"] = round(float(_v.mean()), 1)
+            rep["arrival_steps_p90"] = round(float(_v.quantile(0.9)), 1)
+    except Exception as _e:                       # diagnostic only; never break the eval
+        rep["arrival_steps_note"] = f"unavailable: {type(_e).__name__}"
     rep["notarrived_step_frac"] = round(
         float(_acc.notarrived_steps.sum() / max(_acc.steps * base_env.num_envs, 1)), 4)
     rep["stall_frac"] = round(
@@ -543,7 +562,9 @@ def main(cfg):
               "min_clearance_env_mean", "h_min_train", "h_below0_frac",
               "zero_intervention_rate", "intervened_step_frac", "corr_mean",
               "corr_p50", "corr_p95", "dropped_relevant_frac",
-              "dropped_relevant_step_frac", "relevant_obstacles_total"):
+              "dropped_relevant_step_frac", "relevant_obstacles_total",
+              "arrival_steps_median", "arrival_steps_mean", "arrival_steps_p90",
+              "arrival_steps_n"):
         if k in rep:
             print(f"  {k:28s} = {rep[k]}")
     print("[eval_metrics] " + json.dumps(rep, sort_keys=True), flush=True)
