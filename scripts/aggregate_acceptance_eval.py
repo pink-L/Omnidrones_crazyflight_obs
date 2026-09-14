@@ -30,6 +30,12 @@ METRIC_ORDER = [
     "dropped_relevant_step_frac",
     # [2026-09-14] horizon-independent speed metric (see eval_ckpt.py)
     "arrival_steps_median", "arrival_steps_mean", "arrival_steps_p90",
+    # [2026-09-14] A3 samples 2-8 pillars per env.  Reported so the randomization can be
+    #   WATCHED (min_active_slots stays 0 by decision: in per-pillar mode ">= K" would mean
+    #   "every env must have 8 pillars" and would destroy the range).  A healthy A3 run shows
+    #   a spread; a single distinct value means the randomization has stopped varying.
+    "active_pillars_min", "active_pillars_mean", "active_pillars_max",
+    "active_pillars_distinct",
 ]
 
 
