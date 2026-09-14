@@ -48,6 +48,20 @@ def init_simulation_app(cfg):
             config["extra_args"].append(f"--/app/livestream/publicEndpointAddress={_addr}")
         print(f"[init_simulation_app] livestream enabled (webrtc, port={_ls_port}, "
               f"url=https://<server-ip>:{_ls_port}/streaming)", flush=True)
+    # [2026-09-14] inject extra kit args from the environment, so an experiment can flip a
+    #   renderer setting without editing configs:
+    #       NAVVEL_KIT_EXTRA_ARGS="--/rtx/raytracingEnabled=false"
+    #   WHY: on this box the RTX *raytracing* pipeline build started failing with
+    #       vkCreateRayTracingPipelinesKHR -> VkResult: ERROR_INITIALIZATION_FAILED
+    #   and the kernel logged a matching Xid 31 (MMU fault on the GRAPHICS engine) for
+    #   every eval process - i.e. the GPU's graphics engine is faulting while the CUDA
+    #   compute engine stays perfectly healthy (training runs fine).  Nothing in the
+    #   NavVel metrics needs ray tracing, so being able to turn it off is a legitimate
+    #   workaround.  Defaults to a no-op.
+    _kit_extra = os.environ.get("NAVVEL_KIT_EXTRA_ARGS", "").split()
+    if _kit_extra:
+        config.setdefault("extra_args", []).extend(_kit_extra)
+        print(f"[init_simulation_app] extra kit args: {_kit_extra}", flush=True)
     # Isaac Sim 5.1: use base.kit for GUI (includes viewport), base.python.kit for headless
     import isaacsim as _isaacsim
     _isaacsim_path = os.path.dirname(_isaacsim.__file__)
