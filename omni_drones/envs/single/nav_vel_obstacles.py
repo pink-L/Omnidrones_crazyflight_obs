@@ -141,6 +141,15 @@ class ObstacleManager:
                 "yet: it must be a bottleneck-connectivity check, not a pairwise pillar "
                 "spacing floor. See plan 3.2 (G8/G10). Remove the key to sample without it.")
         self.layout_tries = int(cfg.get("layout_tries", 6))
+        # [P1 A3 2026-09-14] Minimum number of ACTIVE slots per env.  Rationale: when
+        #   M > K the obs window keeps the nearest K slots and `clearances()` masks unused
+        #   slots to +inf.  An env that activates fewer than K slots therefore hands the
+        #   policy FREE window entries (it sees padding where obstacles would be), and the
+        #   dropped_relevant statistics stop meaning what they say.  A3 samples n_pillars
+        #   and layers independently, so this is reachable there (2 pillars x 2 layers = 4
+        #   < K = 8).  0 (default) = no constraint, which keeps the frozen A2/A2L2 worlds
+        #   bit-identical.  See plan 3.2 / section 0.6.5.
+        self.min_active_slots = int(cfg.get("min_active_slots", 0) or 0)
         self.pillar_random = any(x is not None for x in
                                  (self.n_pillars_range, self.pillar_layers_range,
                                   self.pillar_z_range))
@@ -150,12 +159,20 @@ class ObstacleManager:
                                   else self.n_pillars)
             self.pillar_layers_max = (int(self.pillar_layers_range[1])
                                       if self.pillar_layers_range else self.pillar_layers)
+            if self.min_active_slots > self.n_pillars_max * self.pillar_layers_max:
+                raise ValueError(
+                    f"obstacle.min_active_slots={self.min_active_slots} is unreachable: "
+                    f"n_pillars_max * pillar_layers_max = {self.n_pillars_max} * "
+                    f"{self.pillar_layers_max} = "
+                    f"{self.n_pillars_max * self.pillar_layers_max}. Raise a range bound "
+                    f"or lower min_active_slots.")
             # 槽位 = n_max * L_max（每柱预留固定块），未用槽 active=False
             self.M = self.n_pillars_max * self.pillar_layers_max + self.n_free_balls
             if _ow is None:
                 self.obs_window = bool(self.M > self.K)
             print(f"[ObstacleManager] randomized pillars ON: n_pillars<={self.n_pillars_max} "
                   f"layers<={self.pillar_layers_max} -> M={self.M} "
+                  f"min_active_slots={self.min_active_slots} "
                   f"min_corridor={self.min_corridor} tries={self.layout_tries}")
         self.drone_radius = float(cfg.get("drone_radius", 0.15))
         self.inflation = float(cfg.get("inflation", 0.05))
@@ -552,6 +569,22 @@ class ObstacleManager:
 
             nP_e = torch.randint(int(np_lo), int(np_hi) + 1, (n,), device=dev).clamp(min=1)
             L_e = torch.randint(int(lay_lo), int(lay_hi) + 1, (n, nP_max), device=dev)
+            if self.min_active_slots > 0:
+                # [P1 A3 2026-09-14] Satisfy the bound by CONSTRUCTION, not by rejection.
+                #   Rejecting through `ok` (the first thing I tried) does not work: the retry
+                #   loop re-draws from the SAME distribution, so an env that keeps drawing
+                #   2 pillars x 2 layers stays short forever, the loop exhausts layout_tries
+                #   and then returns the invalid layout with only a WARN.  Measured:
+                #   min_active_slots=8 with n_pillars_range=[2,8]/L_max=2 left 74/256 envs
+                #   unsatisfied and the realised minimum was 4.  Instead, promote any env
+                #   below the bound to the full allocation.  __init__ guarantees
+                #   nP_max * L_max >= min_active_slots, so this always succeeds.
+                k_p = torch.arange(nP_max, device=dev)[None, :]                 # (1,P)
+                total = (L_e * (k_p < nP_e[:, None])).sum(dim=-1)               # (n,)
+                short = total < self.min_active_slots
+                if bool(short.any()):
+                    nP_e = torch.where(short, torch.full_like(nP_e, nP_max), nP_e)
+                    L_e = torch.where(short[:, None], torch.full_like(L_e, L_max), L_e)
             z_lo = torch.empty(n, nP_max, device=dev).uniform_(float(zl0), float(zl1))
             z_hi = torch.empty(n, nP_max, device=dev).uniform_(float(zh0), float(zh1))
             z_hi = torch.maximum(z_hi, z_lo + 2.0 * r)      # 至少容得下 1 层
@@ -592,6 +625,15 @@ class ObstacleManager:
                 rad[:, sl] = torch.where(m, torch.full((n, L_max), r, device=dev),
                                          rad[:, sl])
                 act[:, sl] = m
+
+            # Guard rail for the by-construction promotion above: unreachable, but if it
+            # ever fires the layout would silently hand the policy free obs-window slots,
+            # so fail loudly instead.
+            if self.min_active_slots > 0:
+                if int(act.sum(dim=-1).min()) < self.min_active_slots:
+                    raise RuntimeError(
+                        f"min_active_slots={self.min_active_slots} not satisfied: "
+                        f"minimum realised active slots = {int(act.sum(dim=-1).min())}")
 
             if bool(ok.all()):
                 return pos, rad, act
