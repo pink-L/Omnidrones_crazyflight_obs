@@ -1,0 +1,244 @@
+# =====================================================================
+# geometry_profile : P3-fo-pann
+# type             : COMPLETE frozen `task` snapshot (self-contained)
+# generated        : 2026-09-16 by scripts/make_geometry_profile.py
+# derived from     : /home/lz/lzspace/drones/OmniDrones/cfg/profiles/A4.yaml
+# derivation       : COPY of the base snapshot with ONLY the following keys
+#                    changed (kept identical otherwise -> single-variable batch)
+#   cbf.correction_weight: 0.1 -> 0.0
+#   cbf.mode: 'hybrid' -> 'filter_only'
+#   cbf.p_filter_schedule.anneal_frac: '<absent>' -> 0.5
+#   cbf.p_filter_schedule.end: '<absent>' -> 0.0
+#   cbf.p_filter_schedule.mode: '<absent>' -> 'anneal'
+#   cbf.p_filter_schedule.start: '<absent>' -> 1.0
+#   cbf.penalty_src: 'dual' -> 'nominal'
+#   obstacle.reward_obs_log_mode: '<absent>' -> 'penalty'
+# NOTE: cfg/base/{env,sim}_base.yaml are INLINED on purpose -> edits to the
+#       base files can never silently change this frozen profile.
+# NOTE: no defaults list, no CLI override required.  Use as
+#       `python scripts/train.py task=<group path of this file> ...`
+# notes            : P3 filter_only x anneal(1->0, 50% frames); sign=penalty.
+# =====================================================================
+action_transform: velocity
+arena_bound:
+- 3
+- 3
+arrive_bonus: 40
+arrive_hold_steps: 50
+arrive_radius: 0.5
+arrive_time_bonus: 40
+bound_xy: 5
+cbf:
+  a_max: 2
+  alpha: 1
+  correction_sigma: 0.5
+  correction_weight: 0.0
+  filter_grad: detach
+  filter_iterations: 3
+  h_penalty_buffer: 0
+  h_penalty_weight: 0
+  max_vel: null
+  mode: filter_only
+  p_filter_schedule:
+    anneal_frac: 0.5
+    end: 0.0
+    mode: anneal
+    start: 1.0
+  penalty_intrude: true
+  penalty_src: nominal
+  r_safety_margin: 0.05
+  reward_weight: 0.1
+  use_brake_term: false
+controller_sync_dr: true
+curriculum:
+  allow_demote: false
+  collision_rate_threshold: 0.05
+  enabled: false
+  gate_window_episodes: 3000
+  initial_level: 0
+  levels:
+  - 16
+  margin_clearance: 0.1
+  margin_frac: 0.5
+  margin_gate: false
+  min_frames_between_promote: 2000000
+  success_rate_threshold: 0.8
+dr_noise_sigma: 0.15
+drone_model:
+  controller: null
+  name: Crazyflie
+early_death_threshold_steps: 300
+edge_inner: 2.8
+edge_outer: 2.8
+edge_y_range:
+- -2.8
+- 2.8
+edge_z_range:
+- 0.4
+- 2.4
+env:
+  env_spacing: 8
+  max_episode_length: 1500
+  num_envs: 1024
+episode_sampler: edge
+fixed_init: null
+fixed_target: null
+init_pos_range:
+- - -3
+  - -3
+  - 0.4
+- - 3
+  - 3
+  - 2.4
+min_init_target_dist: 1.5
+name: NavVel
+obstacle:
+  collision_margin: 0.05
+  danger_radius: 0.6
+  drone_radius: 0.1
+  early_death_threshold_steps: 300
+  goal_clearance: 0.35
+  inflation: 0.02
+  init_clearance: 0.15
+  keepout_x: 2.5
+  max_collisions: 1
+  max_slots: 8
+  min_corridor: 1.34
+  min_gap_between: 0.25
+  n_free_obstacles: 0
+  n_pillars: 4
+  n_pillars_range:
+  - 2
+  - 8
+  num_scene: 16
+  obs_dist_norm: 5
+  obs_per_pillar: true
+  obs_radius_norm: 0.5
+  obs_safety: none
+  obs_safety_norm: 0.6
+  obs_window: null
+  pillar_layers: 4
+  pillar_layers_range:
+  - 3
+  - 6
+  pillar_radius: 0.4243
+  pillar_z_hi: 2.6
+  pillar_z_lo: 0.4
+  pillar_z_range:
+  - - 0.4
+    - 0.8
+  - - 2.2
+    - 2.6
+  radius_choices:
+  - 0.2
+  - 0.3
+  - 0.4
+  reward_collision_edge: 2
+  reward_early_death_weight: 0
+  reward_near_slowdown_weight: 0.5
+  reward_obs_log_mode: penalty
+  reward_obs_log_scale: 0.3
+  reward_obs_log_weight: 1.5
+  spawn_relax: 0.85
+  spawn_relax_rounds: 6
+  spawn_xy_range:
+  - - -3
+    - -3
+  - - 3
+    - 3
+  spawn_z_range:
+  - 0.6
+  - 2.4
+pbrs_gamma: 0.995
+randomization:
+  drone:
+    eval:
+      drag_coef_scale:
+      - 0.9
+      - 1.1
+      f2m_scale:
+      - 0.8
+      - 1.2
+      inertia_scale:
+      - 0.8
+      - 1.2
+      mass_scale:
+      - 0.97
+      - 1.03
+      t2w_scale:
+      - 0.8
+      - 1.2
+    train:
+      drag_coef_scale:
+      - 0.9
+      - 1.1
+      f2m_scale:
+      - 0.8
+      - 1.2
+      inertia_scale:
+      - 0.8
+      - 1.2
+      mass_scale:
+      - 0.97
+      - 1.03
+      t2w_scale:
+      - 0.8
+      - 1.2
+reward_action_smoothness_weight: 0.2
+reward_crash_penalty: 15
+reward_distance_scale: 1.6
+reward_early_death_weight: 0
+reward_effort_weight: 0.1
+reward_fly_weight: 1.5
+reward_gate_weight: 0
+reward_oob_penalty: 15
+reward_pbrs_weight: 0
+reward_respawn_penalty: 0
+reward_scheme: f1
+reward_time_cost: 0
+reward_timeout_penalty: 60
+reward_zone_weight: 1.5
+sim:
+  bounce_threshold_velocity: 0.2
+  device: cuda:0
+  dt: 0.01
+  enable_stabilization: true
+  friction_correlation_distance: 0.025
+  friction_offset_threshold: 0.04
+  gpu_found_lost_aggregate_pairs_capacity: 33554432
+  gpu_found_lost_pairs_capacity: 4194304
+  gpu_heap_capacity: 67108864
+  gpu_max_num_partitions: 8
+  gpu_max_particle_contacts: 1048576
+  gpu_max_rigid_contact_count: 2097152
+  gpu_max_rigid_patch_count: 2097152
+  gpu_max_soft_body_contacts: 1048576
+  gpu_temp_buffer_capacity: 16777216
+  gpu_total_aggregate_pairs_capacity: 4194304
+  gravity:
+  - 0
+  - 0
+  - -9.81
+  replicate_physics: false
+  solver_type: 1
+  substeps: 1
+  use_flatcache: true
+  use_gpu: true
+  use_gpu_pipeline: true
+soft_respawn: false
+success_terminate: false
+survival_penalty_weight: 0
+target_pos_range:
+- - -3
+  - -3
+  - 0.4
+- - 3
+  - 3
+  - 2.4
+time_encoding: true
+vel_limit:
+  max_vel: 1.8
+  max_yaw_rate: 1.5
+z_max: 3
+z_min: 0.15
+z_ref: 1

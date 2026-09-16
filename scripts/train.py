@@ -96,7 +96,9 @@ def main(cfg):
             dr_sigma = float(cfg.task.get("dr_noise_sigma", 0.0))
             if dr_sigma > 0:
                 transforms.append(CmdGaussNoise(sigma=dr_sigma))
-            cbf_filter = build_cbf_filter(cfg)
+            # [P3 2026-09-16] 训练入口显式启用 p_filter 调度与 info 输出；
+            # 评估/演示脚本不传这两个开关 -> p 恒 1.0、不新增 info 键（逐位兼容）。
+            cbf_filter = build_cbf_filter(cfg, use_schedule=True, emit_info=True)
             if cbf_filter is not None:
                 transforms.append(cbf_filter)
         elif action_transform == "PIDrate":

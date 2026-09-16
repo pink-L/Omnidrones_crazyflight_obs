@@ -398,6 +398,145 @@ def t9_shadow_diag():
           and build_cbf_filter(base).record_diag is False)
 
 
+def t10_p_filter():
+    """[P3 2026-09-16] p_filter：执行概率**只控执行、不控计算**（软蒸馏/退火机制）。
+
+    契约：
+      * p=1（默认）逐位等同旧行为，且**不消耗 RNG**（保 p1 臂的确定性）；
+      * p=0 写回（已限幅）v_nom（裸奔执行），但 diag 里 corr>0（奖励仍有梯度）；
+      * 0<p<1 由 rand 决定执行与否，消耗 RNG；
+      * `p_filter_schedule(step)` 与 `p_filter` 用**同一个**自持计数器（sched_steps）；
+      * emit_info=True 时写 info(p_filter/cbf_corr/cbf_intervened/cbf_executed)。
+    """
+    try:
+        from tensordict import TensorDict
+        from omni_drones.utils.cbf import CBFVelocityFilter
+    except Exception as e:                                   # pragma: no cover
+        check("t10 torchrl/tensordict available", False, str(e))
+        return
+
+    extra = MARGIN                                    # brake off -> cbf_extra = 0.10
+    r_cbf = 0.30 + DRONE_R + INFL + extra             # 0.60
+    D = 0.75                                          # h = 0.15, dmin = 0.25
+    center = torch.tensor([[[1.0, 0.0, 1.0]]])
+    r_safe = torch.full((1, 1), r_cbf)
+    pos = torch.tensor([[[1.0 - D, 0.0, 1.0]]])
+    v_nom = torch.tensor([[[1.5, 0.0, 0.0]]])         # 正对障碍 -> 违例 1.5-0.15=1.35
+
+    def make_td():
+        return TensorDict({
+            ("info", "drone_state"): torch.cat([pos, torch.zeros(1, 1, 10)], -1),
+            ("info", "obstacle_cbf"): torch.cat(
+                [center, r_safe.unsqueeze(-1)], -1).unsqueeze(1),      # (1,1,1,4)
+            ("agents", "action"): v_nom.clone(),
+        }, [1])
+
+    def run(p=1.0, sched=None, info=False):
+        f = CBFVelocityFilter(alpha=ALPHA, iterations=5, do_filter=True,
+                              max_vel=V_MAX, p_filter=p, record_diag=True,
+                              p_filter_schedule=sched, emit_info=info)
+        return f, f._inv_call(make_td())
+
+    # ---- p=1：逐位旧行为，不动 RNG -------------------------------------------
+    s0 = torch.get_rng_state()
+    f1, td1 = run(p=1.0)
+    s1 = torch.get_rng_state()
+    ax = float(td1[("agents", "action")][0, 0, 0])
+    check("t10 p=1 writes projected v", abs(ax - 0.15) < 1e-6, f"v_x={ax:.6f}")
+    check("t10 p=1 consumes no RNG", torch.equal(s0, s1))
+    check("t10 p=1 sched_steps counts once", f1.sched_steps == 1)
+
+    # ---- p=0：裸奔执行（== v_nom），corr 仍>0 ---------------------------------
+    s0 = torch.get_rng_state()
+    f0, td0 = run(p=0.0)
+    s1 = torch.get_rng_state()
+    a0 = td0[("agents", "action")]
+    check("t10 p=0 does NOT filter (action == v_nom)",
+          float((a0 - v_nom).abs().max()) == 0.0,
+          f"max|a-v|={float((a0-v_nom).abs().max()):.3e}")
+    dg0 = f0.diag_tensor()
+    check("t10 p=0 still computes corr>0 (gradient for soft distillation)",
+          dg0 is not None and float(dg0.reshape(-1, 4)[0, 0]) > 1.0,
+          f"corr={float(dg0.reshape(-1,4)[0,0]):.4f}")
+    check("t10 p=0 consumes no RNG", torch.equal(s0, s1))
+
+    # ---- emit_info：键齐全、数值正确 ------------------------------------------
+    f0i, td0i = run(p=0.0, info=True)
+    check("t10 emit_info(p=0) keys",
+          float(td0i[("info", "p_filter")]) == 0.0
+          and float(td0i[("info", "cbf_executed")]) == 0.0
+          and float(td0i[("info", "cbf_intervened")]) == 1.0
+          and float(td0i[("info", "cbf_corr")]) > 1.0)
+    f1i, td1i = run(p=1.0, info=True)
+    check("t10 emit_info(p=1) keys",
+          float(td1i[("info", "cbf_executed")]) == 1.0
+          and abs(float(td1i[("info", "p_filter")]) - 1.0) < 1e-7)
+
+    # ---- 退火 callable：同一时钟；step0 p=1、step2 p=0；p=0.5 混合 --------
+    calls = []
+
+    def sched(step):
+        calls.append(step)
+        return max(0.0, 1.0 - step)
+
+    f2 = CBFVelocityFilter(alpha=ALPHA, iterations=5, do_filter=True,
+                           max_vel=V_MAX, p_filter_schedule=sched, emit_info=True)
+    tds = [f2._inv_call(make_td()) for _ in range(3)]
+    check("t10 schedule clock is 0,1,2", calls == [0, 1, 2])
+    check("t10 schedule step0 filters (0.15)",
+          abs(float(tds[0][("agents", "action")][0, 0, 0]) - 0.15) < 1e-6)
+    check("t10 schedule step2 no filter & flag=0",
+          float((tds[2][("agents", "action")] - v_nom).abs().max()) == 0.0
+          and float(tds[2][("info", "cbf_executed")]) == 0.0)
+    vx_mid = float(tds[1][("agents", "action")][0, 0, 0])
+    check("t10 schedule step1 mixed branch (0.15 or 1.5)",
+          abs(vx_mid - 0.15) < 1e-6 or abs(vx_mid - 1.5) < 1e-6,
+          f"v_x={vx_mid:.4f}")
+
+    # ---- build_cbf_filter：use_schedule / anneal_frac / always_off / p_override --
+    from omegaconf import OmegaConf
+    base = OmegaConf.create({
+        "task": {
+            "cbf": {"mode": "hybrid", "alpha": 1.0,
+                    "p_filter_schedule": {"mode": "anneal", "start": 1.0,
+                                          "end": 0.0, "anneal_frac": 0.5}},
+            "obstacle": {"drone_radius": DRONE_R, "inflation": INFL},
+            "vel_limit": {"max_vel": V_MAX},
+            "env": {"num_envs": 1000},
+        },
+        "total_frames": 100000,
+    })
+    tf = build_cbf_filter(base, use_schedule=True, emit_info=True)
+    # anneal_steps = 100000/1000 * 0.5 = 50 -> p(0)=1, p(25)=0.5, p>=50 -> 0
+    check("t10 build anneal p(0/25/60) = 1/0.5/0",
+          tf is not None and tf.p_filter_schedule is not None
+          and abs(float(tf.p_filter_schedule(0)) - 1.0) < 1e-9
+          and abs(float(tf.p_filter_schedule(25)) - 0.5) < 1e-9
+          and abs(float(tf.p_filter_schedule(60)) - 0.0) < 1e-9)
+    t_def = build_cbf_filter(base)
+    check("t10 build default (use_schedule=False) -> constant p=1",
+          t_def is not None and t_def.p_filter_schedule is None
+          and float(t_def.p_filter) == 1.0 and t_def.emit_info is False)
+    base_off = OmegaConf.create({
+        "task": {
+            "cbf": {"mode": "hybrid",
+                    "p_filter_schedule": {"mode": "always_off"}},
+            "obstacle": {"drone_radius": DRONE_R, "inflation": INFL},
+            "vel_limit": {"max_vel": V_MAX},
+            "env": {"num_envs": 1000},
+        },
+        "total_frames": 100000,
+    })
+    t_off = build_cbf_filter(base_off, use_schedule=True)
+    check("t10 build always_off -> p=0",
+          t_off is not None and float(t_off.p_filter) == 0.0
+          and t_off.p_filter_schedule is None)
+    t_ov = build_cbf_filter(base, use_schedule=True, p_override=1.0)
+    check("t10 p_override beats schedule",
+          t_ov is not None and t_ov.p_filter_schedule is None
+          and float(t_ov.p_filter) == 1.0)
+
+
 if __name__ == "__main__":
     t1_radius()
     t2_head_on_projected()
@@ -408,6 +547,7 @@ if __name__ == "__main__":
     t7_safety_obs_channels()
     t8_h_boundary_penalty()
     t9_shadow_diag()
+    t10_p_filter()
     print()
     if _fail:
         print(f"RESULT: {len(_fail)} FAILED -> {_fail}")

@@ -229,6 +229,13 @@ class CBFVelocityFilter(Transform):
                                      #   "滤波器本会介入多少" (plan §4.3 零介入率/‖Δa‖)
         record_diag=False,           # [K5] True -> 每步把 [‖Δa‖, intervened, h_min, fix_norm]
                                      #   追加到 self.diag_log (纯诊断, 不写 tensordict)
+        p_filter=1.0,                # [P3 2026-09-16] 训练期 filter **执行**概率（只控执行，
+                                     #   不控计算）: a_exec = a_cbf if rand<p else a。
+                                     #   标量 ∈[0,1] 或 callable(step)->float；默认 1.0 = 旧行为。
+        p_filter_schedule=None,      # 可选 callable(step)->float，优先于 p_filter（退火用）
+        emit_info=False,             # [P3] True -> 把 p_filter/cbf_corr/cbf_intervened/
+                                     #   cbf_executed 写进 ("info", ...) 供 env 统计与 eval 取用；
+                                     #   默认 False 保持旧行为逐位不变（不新增 tensordict 键）。
     ):
         if not _TORCHRL:
             raise RuntimeError("CBFVelocityFilter requires torchrl")
@@ -245,6 +252,11 @@ class CBFVelocityFilter(Transform):
         # [K5] 诊断累积：每项 (...,4) = [corr=‖a_cbf-a‖, intervened∈{0,1}, h_min(m), fix_norm]
         self.diag_log = []
         self.diag_steps = 0
+        # [P3] p_filter 调度：自持 step 计数（每次 inv 调用 = 一个 env step，与执行/统计同一计数器）
+        self.p_filter = p_filter
+        self.p_filter_schedule = p_filter_schedule
+        self.emit_info = bool(emit_info)
+        self.sched_steps = 0
 
     def reset_diag(self):
         """清空诊断累积（每次 rollout 前调用）。"""
@@ -282,6 +294,16 @@ class CBFVelocityFilter(Transform):
         # 记录滤波前的指令供奖励核心使用（完整的 4 维，含 yaw）
         tensordict.set(("info", "policy_action"), action.clone())
 
+        # ---- [P3 2026-09-16] p_filter 调度（与执行/统计同一计数器；p 只控执行，不控计算） ----
+        if self.p_filter_schedule is not None:
+            p_t = float(self.p_filter_schedule(self.sched_steps))
+        elif callable(self.p_filter):
+            p_t = float(self.p_filter(self.sched_steps))
+        else:
+            p_t = float(self.p_filter)
+        p_t = min(1.0, max(0.0, p_t))
+        self.sched_steps += 1
+
         # [K5 2026-09-12] shadow=True 时也做计算（诊断），只是不写回动作。
         #   do_filter=False 且 shadow=False（reward_only 臂）-> 完全不算，行为与旧版逐位一致。
         do_eval = self.do_filter or self.shadow
@@ -289,30 +311,55 @@ class CBFVelocityFilter(Transform):
         if do_compute:
             v_safe, fix_norm = filter_velocity(pos, v_nom, p_obs, r_cbf, active,
                                                self.alpha, self.iterations)
+            # ‖a_cbf − a‖：filter_velocity 无违例时原样返回 v_nom -> corr 恒为精确 0，
+            # 因此 intervened = (corr > 0) 与 plan §4.3 的 1[‖a_cbf−a‖==0] 完全一致。
+            corr = (v_safe - v_nom).norm(dim=-1, keepdim=True)              # (...,1)
+            intervened = (corr > 0).to(corr.dtype)
+            _, dist, _ = _gradients(pos, p_obs)
+            h = dist - r_cbf                                                # (...,K)
+            h_masked = torch.where(active, h,
+                                   torch.full_like(h, float("inf")))
+            h_min = h_masked.min(dim=-1, keepdim=True).values               # (...,1)
             if self.record_diag:
-                # ‖a_cbf − a‖：filter_velocity 无违例时原样返回 v_nom -> corr 恒为精确 0，
-                # 因此 intervened = (corr > 0) 与 plan §4.3 的 1[‖a_cbf−a‖==0] 完全一致。
-                corr = (v_safe - v_nom).norm(dim=-1, keepdim=True)          # (...,1)
-                intervened = (corr > 0).to(corr.dtype)
-                _, dist, _ = _gradients(pos, p_obs)
-                h = dist - r_cbf                                            # (...,K)
-                h_masked = torch.where(active, h,
-                                       torch.full_like(h, float("inf")))
-                h_min = h_masked.min(dim=-1, keepdim=True).values           # (...,1)
                 self.diag_log.append(torch.stack(
                     [corr, intervened, h_min, fix_norm.unsqueeze(-1)],
                     dim=-1).detach())                                       # (...,4)
                 self.diag_steps += 1
             if self.do_filter and not self.shadow:
                 action = action.clone()
-                action[..., :3] = v_safe
+                if p_t >= 1.0:
+                    # 逐位兼容：p=1 = 旧行为（不消耗 RNG）
+                    action[..., :3] = v_safe
+                    exec_flag = torch.ones_like(v_nom[..., :1])
+                elif p_t <= 0.0:
+                    # p=0：裸奔执行（写回已限幅 v_nom），corr/viol 仍进奖励与统计（软蒸馏）
+                    action[..., :3] = v_nom
+                    exec_flag = torch.zeros_like(v_nom[..., :1])
+                else:
+                    exec_mask = torch.rand_like(v_nom[..., :1]) < p_t
+                    action[..., :3] = torch.where(exec_mask, v_safe, v_nom)
+                    exec_flag = exec_mask.to(v_nom.dtype)
                 tensordict.set(self.action_key, action)
-        elif self.record_diag and do_eval:
+                if self.emit_info:
+                    tensordict.set(("info", "cbf_executed"), exec_flag)
+            if self.emit_info:
+                tensordict.set(("info", "p_filter"),
+                               torch.full_like(v_nom[..., :1], p_t))
+                tensordict.set(("info", "cbf_corr"), corr.detach())
+                tensordict.set(("info", "cbf_intervened"), intervened.detach())
+        elif do_eval:
             # 诊断模式但本步无活动障碍（dmin=+inf）：零介入、h_min=+inf
             z = torch.zeros_like(v_nom[..., :1])
             inf = torch.full_like(z, float("inf"))
-            self.diag_log.append(torch.cat([z, z, inf, z], dim=-1).detach())
-            self.diag_steps += 1
+            if self.record_diag:
+                self.diag_log.append(torch.cat([z, z, inf, z], dim=-1).detach())
+                self.diag_steps += 1
+            if self.emit_info:
+                tensordict.set(("info", "p_filter"), torch.full_like(z, p_t))
+                tensordict.set(("info", "cbf_corr"), z.clone())
+                tensordict.set(("info", "cbf_intervened"), z.clone())
+                if self.do_filter and not self.shadow:
+                    tensordict.set(("info", "cbf_executed"), z.clone())
         return tensordict
 
 
@@ -361,11 +408,52 @@ def extract_cbf_params(cfg):
         "penalty_intrude": bool(cbf.get("penalty_intrude", True)),
         "filter_grad": str(cbf.get("filter_grad", "detach")),
         "iterations": int(cbf.get("filter_iterations", 3)),
+        "p_filter_schedule": (cbf.get("p_filter_schedule", None) or {}),
     }
 
 
+def _resolve_p_schedule(cfg, sched):
+    """[P3 2026-09-16] 把 ``cbf.p_filter_schedule`` 解析为 (p0, callable|None)。
+
+    sched 缺省 {} -> (1.0, None)（= 旧行为，p 恒 1）。
+    mode: always_on -> (1.0, None)；always_off -> (0.0, None)；
+          anneal    -> (start, callable(step)->线性退火 start→end)。
+    anneal 的步数 = ``total_frames / num_envs * anneal_frac``（单位 = env step，与
+    CBFVelocityFilter 的自身计数一致；调用方唯一 —— 执行与统计同源）。
+    total_frames<=0（如评估脚本）时回退 p=1 并打印告警（不静默）。
+    """
+    mode = str((sched or {}).get("mode", "always_on"))
+    start = float((sched or {}).get("start", 1.0))
+    end = float((sched or {}).get("end", 0.0))
+    if mode == "always_off":
+        return 0.0, None
+    if mode == "always_on":
+        return 1.0, None
+    if mode != "anneal":
+        raise ValueError(f"unknown cbf.p_filter_schedule.mode: {mode!r}")
+    frac = float(sched.get("anneal_frac", 1.0))
+    total_frames = float(cfg.get("total_frames", -1) or -1)
+    num_envs = 1
+    try:
+        num_envs = int(cfg.task.env.num_envs)
+    except Exception:
+        pass
+    if total_frames <= 0:
+        print("[cbf] p_filter anneal requested but total_frames<=0 -> fallback p=1.0",
+              flush=True)
+        return 1.0, None
+    anneal_steps = max(1.0, (total_frames / max(1, num_envs)) * frac)
+
+    def fn(step):
+        t = min(1.0, max(0.0, float(step) / anneal_steps))
+        return start + (end - start) * t
+
+    return start, fn
+
+
 def build_cbf_filter(cfg, action_key=("agents", "action"),
-                     shadow=False, record_diag=False):
+                     shadow=False, record_diag=False, use_schedule=False,
+                     emit_info=False, p_override=None):
     """为环境动作链返回一个 CBFVelocityFilter；若不需要则返回 None。
 
     filter_only / hybrid -> 做滤波 + 记录 v_nom。
@@ -376,10 +464,20 @@ def build_cbf_filter(cfg, action_key=("agents", "action"),
       shadow=True      在 runtime_filter=false 时仍挂上本变换：计算 a_cbf 但不写回动作,
                        用于测量"滤波器本会介入多少"（plan §4.3 零介入率 / ‖Δa‖）。
       record_diag=True 每步把 [‖Δa‖, intervened, h_min, fix_norm] 攒进 self.diag_log。
+
+    [P3 2026-09-16] use_schedule=True 时才读取 ``cbf.p_filter_schedule``（训练入口显式传入；
+    评估/演示等默认 False -> p 恒 1.0，不静默改变谁的行为）。emit_info=True 时写出
+    info(p_filter/cbf_corr/cbf_intervened/cbf_executed)；p_override（float）强制覆盖。
     """
     p = extract_cbf_params(cfg)
     if p is None or p["mode"] == "none":
         return None
+    if p_override is not None:
+        p0, sched_fn = float(p_override), None
+    elif use_schedule:
+        p0, sched_fn = _resolve_p_schedule(cfg, p.get("p_filter_schedule") or {})
+    else:
+        p0, sched_fn = 1.0, None
     return CBFVelocityFilter(
         action_key=action_key,
         alpha=p["alpha"],
@@ -389,6 +487,9 @@ def build_cbf_filter(cfg, action_key=("agents", "action"),
         max_vel=p["v_max"],
         shadow=shadow,
         record_diag=record_diag,
+        p_filter=p0,
+        p_filter_schedule=sched_fn,
+        emit_info=emit_info,
     )
 
 

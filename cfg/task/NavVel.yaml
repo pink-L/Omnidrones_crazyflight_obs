@@ -175,6 +175,11 @@ obstacle:
   # ---- obstacle rewards (m2_plan §4.3, soft-respawn 兼容量级; 每项可单独观测) ----
   reward_obs_log_weight: 1.5    # 障碍 log 距离惩罚权重 (指南 2.0 -> 先小点防过度保守)
   reward_obs_log_scale: 0.3     # λ_log (phi 为自然对数, 危险区 0.6m 内 ~O(1) 量级)
+  # [P3 2026-09-16 用户裁决] log 距离项符号（代码里 φ=ln(d/D)，危险区内 φ<0）：
+  #   penalty = reward += wλΣφ（危险区内为负 = 惩罚；与 kaiwu 原型/设计文档一致）
+  #   legacy  = 旧实现 reward -= wλΣφ（危险区内实为**正奖励**，历史符号错误）
+  #   ⚠️ 代码默认 `legacy` 以保 A0–A4 冻结 profile 逐位复现；本文件与新 P3 profile 显式 penalty。
+  reward_obs_log_mode: penalty
   reward_collision_edge: 2.0    # 每次新进入接触的边沿一次性惩罚 (每步 O(1), 勿学 kaiwu -2500)
   reward_early_death_weight: 0.0  # 碰撞早死反比重罚(默认关, M1 证与多命冲突; 碰撞率不降再小开<1)
   early_death_threshold_steps: 300
@@ -268,6 +273,17 @@ cbf:
   h_penalty_buffer: 0.0     # [E1-v2] 罚提前量(m); 默认 0 = E1 原版逐位兼容
   filter_grad: detach   # detach | through（env 不反传, 语义开关; 默认 detach 稳定）
   filter_iterations: 3  # 迭代投影轮数(每轮修最违反的一个约束; 多障碍用)
+  # [P3 2026-09-16] 训练期 filter **执行**概率（只控执行、不控计算；补 G2）：
+  #   a_exec = a_cbf if rand<p else a；无论 p 为何，corr/viol 照算并进奖励（软蒸馏）。
+  #   mode: always_on（p≡1，= 旧行为）| always_off（p≡0，裸奔执行+被罚偏离 CBF）|
+  #         anneal（start→end 线性，步数 = total_frames/num_envs * anneal_frac）。
+  #   计数器 = filter 自身 env-step（执行与统计唯一同源）；p∈{0,1} 不消耗 RNG（保确定性）。
+  #   ⚠️ 仅 train.py 入口启用调度（use_schedule=True）；eval/演示默认 p=1.0，不静默改行为。
+  p_filter_schedule:
+    mode: always_on       # always_on | anneal | always_off
+    start: 1.0
+    end: 0.0
+    anneal_frac: 0.5      # anneal 占训练总步数比例
 
 # [M3-B 2026-09-06] 训练侧动力学 DR 噪声（执行层随机化, 对齐论文 q_{k+1}=q_k+(v_k+d)Δt,
 #   d~N(0, 20%·v_max)）。task.dr_noise_sigma 给动作平动速度注入高斯噪声(m/s, std)；

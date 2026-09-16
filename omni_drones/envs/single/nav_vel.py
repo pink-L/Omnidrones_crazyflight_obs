@@ -189,6 +189,14 @@ class NavVel(IsaacEnv):
             self.obstacle_max_collisions = int(oc.get("max_collisions", 2))
             self.reward_obs_log_weight = float(oc.get("reward_obs_log_weight", 1.5))
             self.reward_obs_log_scale = float(oc.get("reward_obs_log_scale", 0.3))
+            # [P3 2026-09-16] 障碍 log 距离项符号（用户裁决 = 应为惩罚）：
+            #   legacy  = `reward -= wλΣφ`（φ=ln(d/D)<0 ⇒ 危险区内实为**正奖励**；
+            #             A0–A4 冻结口径的历史实现，逐位保留）
+            #   penalty = `reward += wλΣφ`（危险区内为负 = 惩罚，与 kaiwu 原型/设计文档一致）
+            self.reward_obs_log_mode = str(oc.get("reward_obs_log_mode", "legacy"))
+            if self.reward_obs_log_mode not in ("legacy", "penalty"):
+                raise ValueError(f"unknown reward_obs_log_mode: "
+                                 f"{self.reward_obs_log_mode!r} (legacy|penalty)")
             self.reward_collision_edge = float(oc.get("reward_collision_edge", 2.0))
             self.reward_near_slowdown_weight = float(oc.get("reward_near_slowdown_weight", 0.5))
             self.obstacle_reward_early_death_weight = float(oc.get("reward_early_death_weight", 0.0))
@@ -530,6 +538,16 @@ class NavVel(IsaacEnv):
             "success_rate": UnboundedContinuousTensorSpec(1),  # [2026-09-08] window success = (曾到达∧保持50步) & 0碰撞 (episode_any_arrival 已含保持50步; done 事件率)
             "curriculum_level": UnboundedContinuousTensorSpec(1),  # active obstacle count
             "cbf_violation": UnboundedContinuousTensorSpec(1),  # [M2-3] CBF reward-core violation (>=0)
+            # [P3 2026-09-16] term_* 分项仪器：每步奖励贡献的 EMA（含符号）。
+            #   此前没有分项统计 -> 障碍 log 项符号错误在整个 M2/P0/P1 期间不可见。
+            #   只记录、不参与任何门槛；train 的 stats logger 会自动带上这些键。
+            "term_obs_log": UnboundedContinuousTensorSpec(1),      # ⑦a 障碍 log 项贡献（含符号）
+            "term_near_slow": UnboundedContinuousTensorSpec(1),    # ⑦c 近障减速贡献（<=0）
+            "term_collision_edge": UnboundedContinuousTensorSpec(1),  # ⑦b 碰撞边沿贡献（<=0）
+            "term_cbf_viol": UnboundedContinuousTensorSpec(1),     # ⑧ w1·viol 贡献（<=0）
+            "term_cbf_corr": UnboundedContinuousTensorSpec(1),     # ⑧ -w2·(1-e) 贡献（<=0）
+            "term_h_pen": UnboundedContinuousTensorSpec(1),        # h_penalty 贡献（<=0）
+            "p_filter": UnboundedContinuousTensorSpec(1),          # [P3] 当步 filter 执行概率
         }
         # [NR-1] navgoal/r1/f1-only stats（legacy 保持 stats_spec 逐位不变）:
         #   first_arrival_step = 窗口内首次到达的 progress_buf 步数(0=从未到达, EpisodeStats
@@ -551,6 +569,12 @@ class NavVel(IsaacEnv):
             #   M = num_scene (>= K)；CBF 必须对全部场景障碍安全（不只看 obs 窗口）。
             "obstacle_cbf": UnboundedContinuousTensorSpec(
                 (self.drone.n, self.M, 4), device=self.device),
+            # [P3 2026-09-16] p_filter / CBF 诊断通道。CBFVelocityFilter 仅在
+            #   emit_info=True（train.py 训练入口）时写入；其余调用方不写 -> 恒 0。
+            "p_filter": UnboundedContinuousTensorSpec((self.drone.n, 1), device=self.device),
+            "cbf_corr": UnboundedContinuousTensorSpec((self.drone.n, 1), device=self.device),
+            "cbf_intervened": UnboundedContinuousTensorSpec((self.drone.n, 1), device=self.device),
+            "cbf_executed": UnboundedContinuousTensorSpec((self.drone.n, 1), device=self.device),
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["info"] = info_spec
         self.info = info_spec.zero()
@@ -726,6 +750,13 @@ class NavVel(IsaacEnv):
         self.info["prev_action"] = tensordict[("info", "prev_action")]
         if ("info", "policy_action") in tensordict.keys(True, True):
             self.info["policy_action"] = tensordict[("info", "policy_action")]
+        # [P3 2026-09-16] p_filter / CBF 诊断通道（仅 train 入口 emit_info=True 时存在）
+        if ("info", "p_filter") in tensordict.keys(True, True):
+            self.info["p_filter"] = tensordict[("info", "p_filter")]
+        if ("info", "cbf_corr") in tensordict.keys(True, True):
+            self.info["cbf_corr"] = tensordict[("info", "cbf_corr")]
+        if ("info", "cbf_intervened") in tensordict.keys(True, True):
+            self.info["cbf_intervened"] = tensordict[("info", "cbf_intervened")]
         self.prev_actions = self.info["prev_action"].clone()
         # [NR-1] cache previous policy velocity-cmd for action-layer smoothness.
         #   info.policy_action 由 CBFVelocityFilter 写 = 滤波前策略 4D 指令 (含 yaw)。
@@ -946,11 +977,21 @@ class NavVel(IsaacEnv):
                 neg = d <= 0                                        # inside the ball
                 phi = torch.where(neg, torch.log(torch.tensor(1e-3 / D, device=self.device))
                                   + 100.0 * d, phi)
-                reward = reward - self.reward_obs_log_weight * self.reward_obs_log_scale \
+                _log_term = self.reward_obs_log_weight * self.reward_obs_log_scale \
                     * phi.sum(dim=-1, keepdim=True)
+                # [P3 2026-09-16 用户裁决] φ = ln(d/D) ≤ 0（危险区内）⇒ `+φ` 即"越近越负"的惩罚。
+                if self.reward_obs_log_mode == "penalty":
+                    _log_contrib = _log_term
+                else:
+                    # legacy：与 A0–A4 冻结口径逐位一致（危险区内实为 +奖励，历史符号错误）
+                    _log_contrib = -_log_term
+                reward = reward + _log_contrib
+                self.stats["term_obs_log"].lerp_(_log_contrib.detach(), (1 - self.alpha))
 
             # 2) one-shot collision-edge penalty (only on new contacts)
-            reward = reward - self.reward_collision_edge * new_edge.float()
+            _edge_contrib = -self.reward_collision_edge * new_edge.float()
+            reward = reward + _edge_contrib
+            self.stats["term_collision_edge"].lerp_(_edge_contrib.detach(), (1 - self.alpha))
 
             # 3) near-obstacle slowdown penalty (optional, default on small)
             if self.reward_near_slowdown_weight > 0:
@@ -967,6 +1008,7 @@ class NavVel(IsaacEnv):
                     1.0 - dmin / self.obstacle_danger_radius, min=0.0)
                 slow = slow * (finite & active_any & (dmin < self.obstacle_danger_radius))
                 reward = reward - slow
+                self.stats["term_near_slow"].lerp_((-slow).detach(), (1 - self.alpha))
 
             # 4) a life that accumulates max_collisions contacts soft-respawns (kept as a
             #    separate cause, outside crash/oob, so the drone gets another life)
@@ -993,6 +1035,10 @@ class NavVel(IsaacEnv):
                     act.unsqueeze(1),
                     self.cbf_alpha, self.cbf_penalty_intrude)          # (N,1) <= 0
                 self.stats["cbf_violation"].lerp_(-viol, (1 - self.alpha))
+                # [P3 2026-09-16] 分项仪器初值（下面各分支填实际贡献）
+                _term_viol = torch.zeros_like(viol)
+                _term_corr = torch.zeros_like(viol)
+                _term_hpen = torch.zeros_like(viol)
                 # viol <= 0 (more negative = more unsafe): ADD it (weighted) so the unsafe
                 # command is PENALIZED. Do NOT subtract (that would reward violations --
                 # bug found 2026-09-05: return ballooned to ~1e4 while policy learned to
@@ -1023,7 +1069,8 @@ class NavVel(IsaacEnv):
                     #   (do_filter=False, 无纠偏) 自动回退 nominal。
                     if self.cbf_penalty_src == "dual":
                         # [M3-A] viol 项 w1·viol(任何模式都可用, vnom 即策略输出)
-                        reward = reward + self.cbf_reward_weight * viol
+                        _term_viol = self.cbf_reward_weight * viol
+                        reward = reward + _term_viol
                         # [M3-A] correction 项 w2·(1−exp(−corr²/σ²)): 需真实滤波才有
                         # v_safe≠vnom; 无滤波时无纠偏 → dual 退化为仅 w1·viol 项。
                         if self.cbf_use_filter and self.cbf_correction_weight > 0:
@@ -1034,7 +1081,8 @@ class NavVel(IsaacEnv):
                             corr = (v_safe - vnom).norm(dim=-1)      # (N,1) >= 0
                             sig2 = self.cbf_correction_sigma ** 2
                             pen = self.cbf_correction_weight * (1.0 - torch.exp(-(corr ** 2) / sig2))
-                            reward = reward - pen
+                            _term_corr = -pen
+                            reward = reward + _term_corr
                     elif self.cbf_penalty_src in ("correction", "gaussian") and self.cbf_use_filter:
                         v_safe, _ = filter_velocity(
                             drone_pos, vnom,
@@ -1044,11 +1092,14 @@ class NavVel(IsaacEnv):
                         if self.cbf_penalty_src == "gaussian":
                             sig2 = self.cbf_correction_sigma ** 2
                             pen = self.cbf_reward_weight * (1.0 - torch.exp(-(corr ** 2) / sig2))
-                            reward = reward - pen
+                            _term_corr = -pen
+                            reward = reward + _term_corr
                         else:
-                            reward = reward - self.cbf_reward_weight * corr
+                            _term_corr = -self.cbf_reward_weight * corr
+                            reward = reward + _term_corr
                     else:
-                        reward = reward + self.cbf_reward_weight * viol
+                        _term_viol = self.cbf_reward_weight * viol
+                        reward = reward + _term_viol
 
                 # [New2/E1 2026-09-07] CBF 边界余量罚(独立于 penalty_src, 任何有 CBF 的模式可用):
                 #   h = dmin - cbf_extra(0 穿越点 = filter 介入边界)。罚 w_h*relu(buffer-h) → 策略
@@ -1058,9 +1109,14 @@ class NavVel(IsaacEnv):
                 #   dmin 为几何表面净空(obstacle 块上方已算; 无活动障碍=inf → 罚=0)。
                 #   默认 w_h=0 = 逐位不变。
                 if self.cbf_h_penalty_weight > 0:
-                    reward = reward - h_boundary_penalty(
+                    _term_hpen = -h_boundary_penalty(
                         dmin, float(self.cbf_extra),
                         self.cbf_h_penalty_buffer, self.cbf_h_penalty_weight)
+                    reward = reward + _term_hpen
+                # [P3 2026-09-16] 分项仪器落账（EMA；只记录，供标定与符号核查）
+                self.stats["term_cbf_viol"].lerp_(_term_viol.detach(), (1 - self.alpha))
+                self.stats["term_cbf_corr"].lerp_(_term_corr.detach(), (1 - self.alpha))
+                self.stats["term_h_pen"].lerp_(_term_hpen.detach(), (1 - self.alpha))
 
         # --- per-life / termination bookkeeping (spatial bounds, env frame) ---
         self.life_steps += 1
@@ -1142,6 +1198,11 @@ class NavVel(IsaacEnv):
             self.term_cause = torch.where(done_cause.unsqueeze(-1), cause, self.term_cause)
 
         # stats (EMA)
+        # [P3 2026-09-16] p_filter 当步值（train 入口 emit_info=True 时由 filter 写入；
+        #   未挂 filter 的臂恒 0 = "不执行滤波"）
+        self.stats["p_filter"].lerp_(
+            self.info["p_filter"].detach().float().reshape(self.num_envs, 1),
+            (1 - self.alpha))
         self.stats["pos_error"].lerp_(pos_error, (1 - self.alpha))
         self.stats["heading_alignment"].lerp_(heading_alignment, (1 - self.alpha))
         self.stats["uprightness"].lerp_(self.drone_state[..., 18], (1 - self.alpha))

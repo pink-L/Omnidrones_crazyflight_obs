@@ -680,6 +680,29 @@ def main(cfg):
         rep["h_min_train"] = round(float(hf.min()), 4) if hf.numel() else None
         rep["h_below0_frac"] = (round(float((hf < 0).float().mean()), 4)
                                 if hf.numel() else None)
+        # ---- [P3 2026-09-16] 可选 diag 落盘（+dump_diag=<dir>） -------------------
+        #   把逐步 diag (T, N, 4) = [corr, intervened, h_min, fix_norm] 存成 npz，
+        #   供 CPU 离线分析"干预发生在什么时候/离边界多近"（plan §7.1 收尾、F3 定标）。
+        #   默认不写（不改变任何既有行为）。
+        _dd = cfg.get("dump_diag", None)
+        if _dd:
+            try:
+                import os as _os
+                import numpy as _np
+                _dg = cbf_filter.diag_tensor().detach().cpu()
+                _os.makedirs(str(_dd), exist_ok=True)
+                _fn = _os.path.join(
+                    str(_dd),
+                    f"diag_s{rep['seed']}_{'on' if rep['runtime_filter'] else 'off'}.npz")
+                _np.savez_compressed(_fn, diag=_dg.numpy(),
+                                     cbf_extra=float(rep.get("cbf_extra", 0.0)),
+                                     seed=int(rep["seed"]),
+                                     runtime_filter=bool(rep["runtime_filter"]))
+                rep["diag_dump"] = _fn
+                print(f"[eval_ckpt] diag dumped -> {_fn}  shape={tuple(_dg.shape)}",
+                      flush=True)
+            except Exception as _e:                    # diagnostic only; never break the eval
+                rep["diag_dump_error"] = f"{type(_e).__name__}: {_e}"
     if cbf_filter is None:
         rep["zero_intervention_rate"] = None
         rep["h_min_train"] = None
