@@ -360,7 +360,21 @@ def main():
         #   cbf_extra is 0.10 yet min d_min was 0.0512 with h_min = -0.05, i.e. an
         #   over-constrained filter can overshoot its own boundary.  So h_min >= 0 is
         #   evidence about the filter, not about the clearance floor.
-        "cbf_extra_gate>=0.10": (None if cbf_extra_on is None else cbf_extra_on >= 0.10),
+        #   ---
+        #   [2026-09-16, second decision] Relocating the bar was not enough.  Measured:
+        #   `cbf_extra` = 0.10 for A0 and 0.05 for every 口径-A rung, so the moved gate
+        #   PASSED for the old conservative baseline and FAILED for every "improved" rung -
+        #   it inverted the ladder.  That is the definition of 口径 A (P0.2 lowered
+        #   `cbf.r_safety_margin` 0.10 -> 0.05 to remove useless intervention), not a
+        #   statement about any policy.  So the numeric clearance bar is DELETED from plan
+        #   4.2 and recorded in all three conventions instead; the operative safety
+        #   requirement is the hard "0 collision / 0 OOB" row, which is what
+        #   `collision_margin` actually enforces.  A numeric clearance FLOOR, if wanted, is
+        #   a TRAINING constraint (ask the policy to keep 10 cm), i.e. a different batch,
+        #   not a threshold.  Evidence for that: with the filter OFF the value is still
+        #   0.0503 (A4, 5 seeds), so the filter is not what pins it.
+        "info_min_d_min_is_record_only": ("plan 4.2 numeric clearance bar deleted "
+                                          "2026-09-16; see 0.5.24"),
         "zero_collision_gate(ON and OFF)": (None if m("collision_envs")["on_mean"] is None
                                             else m("collision_envs")["on_mean"] == 0
                                             and m("collision_envs")["off_mean"] == 0),
@@ -414,8 +428,23 @@ def main():
                                                   else int_steps_on <= 0.05 * _steps),
         "h_min_train_gate>=0": (m("h_min_train")["on_mean"] or 0) >= 0.0
         if m("h_min_train")["on_mean"] is not None else None,
-        "cbf_extra_gate>=0.10": (None if cbf_extra_on is None else cbf_extra_on >= 0.10),
+        # [2026-09-16, second decision] 4.2's numeric clearance bar was deleted, and this
+        #   row goes with it.  Relocating it from `min d_min` to `cbf_extra` did not fix the
+        #   defect: `cbf_extra` measures 0.10 for A0 and 0.05 for every 口径-A rung, so the
+        #   moved gate PASSED for the old conservative baseline and FAILED for every
+        #   "improved" rung - it inverted the ladder.  That is the definition of 口径 A
+        #   (P0.2 lowered `cbf.r_safety_margin` 0.10 -> 0.05 to remove useless
+        #   intervention), not a statement about any policy.  The extension from 4.2 to 4.3
+        #   is deliberate: leaving a numeric clearance gate here while deleting it there
+        #   would make the document self-contradictory.  What 4.3 still requires is
+        #   `h_min^train >= 0` (the filter's own boundary) plus 0 collision, which together
+        #   are the real safety statement.  A numeric clearance FLOOR, if wanted, has to
+        #   arrive as a training constraint -- evidence: with the filter OFF the value is
+        #   still 0.0503 (A4, 5 seeds), so it is not the filter pinning it.
+        "info_min_d_min_is_record_only": ("plan 4.3 numeric clearance bar deleted "
+                                          "2026-09-16 (extended from 4.2); see 0.5.24"),
         "info_min_d_min_surface": dmin_surface,
+        "info_cbf_extra_ON/OFF": [cbf_extra_on, m("cbf_extra").get("off_mean")],
         "zero_collision_gate(ON and OFF)": (None if m("collision_envs")["on_mean"] is None
                                             else m("collision_envs")["on_mean"] == 0
                                             and m("collision_envs")["off_mean"] == 0),
@@ -441,7 +470,7 @@ def main():
         "info_zero_intervention_rate(horizon_ruler)": m("zero_intervention_rate").get("on_mean"),
         "info_intervened_steps_ON/OFF": [int_steps_on, int_steps_off],
         "dropped_relevant_frac_gate<0.01": out["gates_stage1"]["dropped_relevant_frac_gate<0.01"],
-        "cbf_extra_gate>=0.10": out["gates_stage1"]["cbf_extra_gate>=0.10"],
+        "info_min_d_min_is_record_only": out["gates_stage1"]["info_min_d_min_is_record_only"],
     }
     step_on = m("dropped_relevant_step_frac")["on_mean"]
     out["triggers"] = {

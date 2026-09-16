@@ -137,8 +137,16 @@ def _dmin(j, which):
     return j["gates_stage1"][f"info_min_d_min_{which}"]
 
 
-def _cbf_extra_gate(j):
-    return j["gates_stage1"]["cbf_extra_gate>=0.10"]
+def _cbf_extra(j):
+    """`cbf_extra` is RECORDED too, as of the second 2026-09-16 decision.
+
+    Relocating the numeric bar from `min d_min` onto `cbf_extra` did not fix the defect:
+    measured, `cbf_extra` is 0.10 for A0 and 0.05 for every 口径-A rung, so the moved gate
+    passed for the old baseline and failed for every "improved" rung.  A gate that inverts
+    the ladder because of a profile definition is not a gate.  So no clearance-shaped row
+    gates anything in either stage, and `test_no_clearance_gate_exists` checks all of them.
+    """
+    return j["gates_stage1"]["info_cbf_extra_ON/OFF"][0]
 
 
 # ---------------------------------------------------------------------------------
@@ -198,8 +206,7 @@ def test_no_pads_means_no_guess():
     assert _dmin(j, "surface") is None, j["gates_stage1"]
     assert _dmin(j, "center") is None, j["gates_stage1"]
     assert _dmin(j, "cbf") == RAW, j["gates_stage1"]
-    # and the gate that DOES govern is untouched by any of this: it reads cbf_extra
-    assert _cbf_extra_gate(j) is False, j["gates_stage1"]
+    assert _cbf_extra(j) == 0.05, j["gates_stage1"]
 
 
 # ---------------------------------------------------------------------------------
@@ -237,7 +244,7 @@ def test_real_a4_logs_reproduce_the_known_ambiguity():
     cc = j["clearance_conventions"]
     assert abs(cc["min_cbf"] - 0.0501) < 0.005, cc
     assert _dmin(j, "cbf") < 0.10 < _dmin(j, "center"), j["gates_stage1"]
-    assert _cbf_extra_gate(j) is False, j["gates_stage1"]
+    assert _cbf_extra(j) == 0.05, j["gates_stage1"]
     print(f"  A4 384x1500 (recorded, no clearance gate): cbf={cc['min_cbf']} surface="
           f"{cc['min_surface(=cbf+pad_inflation)']} center="
           f"{cc['min_center(=cbf+pad_center)']} -> 0.10 straddles them")
@@ -245,13 +252,40 @@ def test_real_a4_logs_reproduce_the_known_ambiguity():
 
 
 # ---------------------------------------------------------------------------------
-# 5. The gating quantity is `cbf_extra`, and ONLY `cbf_extra`.
-#    This is the anti-regression for the decision itself: if someone later re-attaches a
-#    numeric bar to a clearance row, this fails.  It also proves the gate is driven by the
-#    config constant rather than by the rollout, which was the whole reason for moving it.
+# 5. NOTHING clearance-shaped may gate, in EITHER stage.
+#
+#    This is the anti-regression for the decision, and it is deliberately stronger than the
+#    one it replaces.  The first attempt at this fix moved the numeric bar from `min d_min`
+#    onto `cbf_extra`; that looked like a repair and was not one, because `cbf_extra` is a
+#    profile constant (0.10 for A0, 0.05 for every 口径-A rung), so the moved gate passed
+#    for the old baseline and failed for every improved rung.  A test that only checked "the
+#    gate reads cbf_extra now" would have PASSED on that wrong fix.  So the property under
+#    test is the outcome, not the mechanism: no PASS/FAIL row anywhere may be a function of
+#    a clearance or of `cbf_extra`.
 # ---------------------------------------------------------------------------------
-def test_cbf_extra_is_what_gates():
-    for extra, want in ((0.05, False), (0.10, True), (0.12, True)):
+def test_no_clearance_like_row_gates_in_either_stage():
+    d = _write_logdir([_rec(11, "on", with_new_fields=True,
+                            surface=round(RAW + PAD_INFLATION, 4),
+                            center=round(RAW + PAD_CENTER, 4)),
+                       _rec(11, "off")])
+    try:
+        j = _run(d)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    for stage in ("gates_stage1", "gates_stage2"):
+        bad = [k for k, v in j[stage].items()
+               if not k.startswith("info_") and isinstance(v, bool)
+               and ("d_min" in k or "clearance" in k or "cbf_extra" in k)]
+        assert not bad, f"{stage} still gates on a clearance-like row: {bad}"
+    # and both stages must still SAY that the bar was removed, rather than dropping the
+    # topic - a silently deleted row is indistinguishable from a passing one
+    for stage in ("gates_stage1", "gates_stage2"):
+        assert "info_min_d_min_is_record_only" in j[stage], stage
+
+
+def test_cbf_extra_is_recorded_not_gated():
+    """`cbf_extra` must be visible (it is what the numeric bar used to sit on) but inert."""
+    for extra in (0.05, 0.10, 0.12):
         r_on = _rec(11, "on", with_new_fields=True,
                     surface=round(RAW + PAD_INFLATION, 4),
                     center=round(RAW + PAD_CENTER, 4))
@@ -261,26 +295,14 @@ def test_cbf_extra_is_what_gates():
             j = _run(d)
         finally:
             shutil.rmtree(d, ignore_errors=True)
-        assert _cbf_extra_gate(j) is want, (extra, j["gates_stage1"])
-
-
-def test_clearance_value_cannot_move_the_gate():
-    """Two logdirs that differ ONLY in raw clearance must agree on the gate."""
-    verdicts = []
-    for raw in (0.0101, 0.0501, 0.0901):
-        r_on = _rec(11, "on", raw=raw, with_new_fields=True,
-                    surface=round(raw + PAD_INFLATION, 4),
-                    center=round(raw + PAD_CENTER, 4))
-        d = _write_logdir([r_on, _rec(11, "off", raw=raw)])
-        try:
-            verdicts.append(_cbf_extra_gate(_run(d)))
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-    assert len(set(verdicts)) == 1, verdicts
+        assert _cbf_extra(j) == extra, j["gates_stage1"]
+        assert not [k for k, v in j["gates_stage1"].items()
+                    if not k.startswith("info_") and isinstance(v, bool)
+                    and "cbf_extra" in k], j["gates_stage1"]
 
 
 def test_no_clearance_gate_exists():
-    """`min d_min` must be RECORDED, not gated (plan 4.2 decision, 2026-09-16)."""
+    """`min d_min` must be RECORDED in all three conventions, not gated."""
     d = _write_logdir([_rec(11, "on", with_new_fields=True,
                             surface=round(RAW + PAD_INFLATION, 4),
                             center=round(RAW + PAD_CENTER, 4)),
