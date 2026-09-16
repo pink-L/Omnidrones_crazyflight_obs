@@ -97,6 +97,10 @@ def main():
     ap.add_argument("--label", default="unnamed")
     ap.add_argument("--allow-partial", action="store_true",
                     help="emit the table even if some logs have no [eval_metrics] line")
+    ap.add_argument("--baseline", default=None, metavar="AGG.JSON",
+                    help="agg.json of the plan-4.2 baseline (A0).  Needed to decide the "
+                         "two 'not worse than A0' rows; without it they print n/a, which "
+                         "is indistinguishable from 'not measured' (pit 14).")
     ap.add_argument("--d-min-inflation-pad", type=float, default=None, metavar="M",
                     help="legacy logdirs only: the `inflation` cushion, needed to convert "
                          "min_clearance_global_min into the SURFACE convention.  Profile A "
@@ -292,6 +296,48 @@ def main():
 
     cbf_extra_on = m("cbf_extra").get("on_mean")
 
+    # [2026-09-16] plan 4.2's two RELATIVE rows ("z_err RMSE / 终端速度 | 不劣于 A0").
+    #   They were `None` for as long as A0 had never been measured, and a permanent `n/a`
+    #   in a gate table reads exactly like a gate that was checked and passed - the same
+    #   failure mode this whole step exists to remove (pit 14).  So the baseline is an
+    #   input, and a delta smaller than the seed spread of either side is NOT reported as
+    #   a pass on merit (A4 vs A2L3 looked ordered at 3 seeds and dissolved at 5).
+    rel = {}
+    _bnote = None
+    if args.baseline:
+        try:
+            with open(args.baseline) as fh:
+                _bj = json.load(fh)
+            _bp, _bs = _bj.get("protocol", {}), _bj.get("summary", {})
+            _here = (runs[0].get("num_envs"), runs[0].get("rollout_steps"))
+            if (_bp.get("num_envs"), _bp.get("rollout_steps")) != _here:
+                _bnote = (f"baseline is {_bp.get('num_envs')}x{_bp.get('rollout_steps')} "
+                          f"but this batch is {_here[0]}x{_here[1]}: refused")
+            else:
+                for _k, _dirn in (("z_err_rmse", "lower"),
+                                  ("terminal_speed_xy", "lower")):
+                    _b, _r = _bs.get(_k, {}), m(_k)
+                    _bon, _ron = _b.get("on_mean"), _r.get("on_mean")
+                    if _bon is None or _ron is None:
+                        _bnote = f"{_k}: baseline or batch value missing"
+                        rel[_k] = None
+                        continue
+                    _d = round(_ron - _bon, 4)
+                    _spread = max(_b.get("on_range") or 0.0, _r.get("on_range") or 0.0)
+                    _nw = (_d <= 0) if _dirn == "lower" else (_d >= 0)
+                    _tag = ("within seed spread" if abs(_d) <= _spread and _d != 0
+                            else ("equal" if _d == 0
+                                  else ("better" if _nw else "worse")))
+                    rel[_k] = {"pass": bool(_nw), "note": _tag,
+                               "baseline_on": _bon, f"{args.label}_on": _ron,
+                               "delta": _d, "seed_spread": _spread,
+                               "label": _bj.get("label")}
+        except Exception as _e:
+            _bnote = f"baseline unreadable: {type(_e).__name__}: {_e}"
+    else:
+        _bnote = ("no --baseline given: A0 has to be measured to decide these rows "
+                  "(scripts/compare_to_baseline.py drills into them)")
+
     # ---- PLAN 4.2: stage 1 (geometric generalisation) --------------------------------
     # 4.1 is explicit that the two stages use DIFFERENT gate sets and disagree about the
     # same metric on purpose: "CBF intervention rate" is "record only, high is allowed" in
@@ -323,8 +369,10 @@ def main():
         "dropped_relevant_frac_gate<0.01": (m("dropped_relevant_frac")["on_mean"] or 0) < 0.01,
         # "not worse than A0" - needs the v1.0.0 baseline to compare, so these stay n/a until
         # the baseline values are recorded; the guide's absolute bars are 0.10 m / 0.15 m/s.
-        "z_err_rmse_gate(not worse than A0)": None,
-        "terminal_speed_gate(not worse than A0)": None,
+        # Relative rows; `None` when no --baseline was supplied (and then the report says
+        # so out loud rather than leaving a bare n/a that looks like a pass).
+        "z_err_rmse_gate(not worse than A0)": (rel.get("z_err_rmse") or {}).get("pass"),
+        "terminal_speed_gate(not worse than A0)": (rel.get("terminal_speed_xy") or {}).get("pass"),
         # ---- stage-1 RECORD-ONLY (4.2 says "record", not gate) ----------------------
         "info_stage1_cbf_intervened_step_frac": m("intervened_step_frac")["on_mean"],
         "info_stage1_cbf_intervened_steps_ON/OFF": [int_steps_on, int_steps_off],
@@ -339,6 +387,16 @@ def main():
         "info_terminal_speed_xy": vt,
         "info_path_length_ratio": plr,
         "info_active_pillars_mean": m("active_pillars_mean")["on_mean"],
+        "info_baseline_note": _bnote,
+        "info_vs_A0_z_err_rmse": (None if not rel.get("z_err_rmse")
+                                  else rel["z_err_rmse"]["note"] + " (delta "
+                                  f"{rel['z_err_rmse']['delta']}, spread "
+                                  f"{rel['z_err_rmse']['seed_spread']})"),
+        "info_vs_A0_terminal_speed": (None if not rel.get("terminal_speed_xy")
+                                      else rel["terminal_speed_xy"]["note"] + " (delta "
+                                      f"{rel['terminal_speed_xy']['delta']}, spread "
+                                      f"{rel['terminal_speed_xy']['seed_spread']})"),
+        "info_terminal_z_err": m("terminal_z_err").get("on_mean"),
     }
 
     # ---- PLAN 4.3: stage 2 (remove the runtime filter) -------------------------------
