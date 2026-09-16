@@ -30,7 +30,9 @@
 #   joint  = arr ∧ 整窗 0 碰撞边沿 的 env 比例（同课程 success 定义）
 # 注: 训练配置里 reward 键（arrive_bonus 等）不影响判定, 仅为保持 obs/几何与训练同构而带上。
 # ==============================================================================
+import collections
 import logging
+import math
 import hydra
 import torch
 
@@ -265,6 +267,27 @@ def main(cfg):
             self.dr_dropped = 0.0
             self.steps = 0
             self.layout_fp = None            # 布局指纹（首步采样一次），验证 ON/OFF 同分布
+            # [2026-09-16] plan 4.2 trajectory metrics (guide-defined).  `rpos` is
+            # `target_pos - drone_state[..., :3]`, so it gives us the height error and the
+            # straight-line distance for free, with no extra env plumbing:
+            #   z_err_rmse        = RMSE of |rpos_z| over the whole rollout
+            #   path_length_ratio = sum |d rpos| / |rpos| at the first sample
+            #   terminal_speed_xy = mean |v_xy| over the LAST 0.5 s of the rollout
+            self.dt = float(getattr(b, "dt", 0.01) or 0.01)
+            self.term_win = max(1, int(round(0.5 / self.dt)))
+            self.term_buf = collections.deque(maxlen=self.term_win)
+            # [2026-09-16] `terminal_z_err` is a DIAGNOSTIC, not a plan row, added because
+            #   a whole-rollout `z_err` RMSE is dominated by the initial climb (start z 0.5
+            #   -> goal z 1.0) and therefore cannot be read against the guide's 0.10 m bar,
+            #   which belongs to the hardware regime (the real drone starts near the goal
+            #   altitude).  Splitting "did it end up at the goal height" from "how fast did
+            #   it climb" makes the RMSE interpretable instead of mysterious.
+            self.term_z_buf = collections.deque(maxlen=self.term_win)
+            self.z_sq_sum = 0.0
+            self.z_n = 0
+            self.path_len = torch.zeros(n, 1, device=dev)
+            self.straight = None             # (N,1) straight-line distance, set on step 1
+            self.prev_rpos = None
 
         @torch.no_grad()
         def __call__(self, _env, *args, **kwargs):
@@ -279,6 +302,25 @@ def main(cfg):
                 oob_ = oob_ | (pos_[..., 0].abs() > ax) | (pos_[..., 1].abs() > b.arena_bound_y)
             self.oob |= oob_
             r = torch.norm(b.rpos.float(), dim=-1)                        # (N,1)
+            # ---- [2026-09-16] trajectory metrics (see __init__ for the definitions) --
+            # The callback runs AFTER each env.step, so the first sample here is the state
+            # at t=dt, not t=0.  The straight-line distance is therefore short by at most
+            # one step of travel (~1 m/s * 0.01 s = 1 cm), which is far below the 0.01
+            # resolution we report the ratio at; noted rather than corrected.
+            rp = b.rpos.float()                                           # (N,1,3)
+            if self.straight is None:
+                self.straight = torch.norm(rp, dim=-1)                    # (N,1)
+            else:
+                self.path_len += torch.norm(rp - self.prev_rpos, dim=-1)
+            self.prev_rpos = rp
+            ze = rp[..., 2].abs()
+            fz = torch.isfinite(ze)
+            if bool(fz.any()):
+                self.z_sq_sum += float((ze[fz] ** 2).sum())
+                self.z_n += int(fz.sum())
+            # xy speed uses the same velocity slice as `sp` below, but drops z
+            self.term_buf.append(torch.norm(b.drone_state[..., 7:9].float(), dim=-1))
+            self.term_z_buf.append(ze)
             for rad in ARR_RADII:
                 self.inside[rad] = torch.where(r < rad, self.inside[rad] + 1,
                                                torch.zeros_like(self.inside[rad]))
@@ -564,6 +606,64 @@ def main(cfg):
         if f.numel():
             rep["min_clearance_global_min"] = round(float(f.min()), 4)
             rep["min_clearance_env_mean"] = round(float(f.mean()), 4)
+            # [2026-09-16] THREE CONVENTIONS, ONE RAW NUMBER.
+            #   `ObstacleManager.clearances()` returns
+            #       |p - p_oi| - (r_oi + drone_radius + inflation)
+            #   i.e. the CENTRE distance minus the *whole* decision radius.  The env header
+            #   (nav_vel_obstacles.py L27-28) says drone_radius is the drone's physical
+            #   sphere and inflation is an extra cushion on top, so this raw value is
+            #   drone-surface-to-obstacle-surface MINUS the cushion.  Three different
+            #   documents then call the result "d_min" while meaning three different
+            #   quantities, and the profile-A pad is small enough (0.12 m) that the choice
+            #   flips `min d_min >= 0.10` from PASS to FAIL.  So report all three, derived
+            #   from the live config rather than hardcoded, and let the plan pick:
+            #     cbf     = |p-p_oi| - (r_oi+dr+inf)   <- what the CBF acts on; == raw
+            #     surface = |p-p_oi| - (r_oi+dr)       <- drone body surface <-> obstacle
+            #                                             surface  (plan 4.2 "表面净空")
+            #     center  = |p-p_oi| - r_oi            <- drone centre <-> obstacle surface
+            #                                             (guide B.3 notation `d_i`)
+            # Cross-check available at runtime: h_min_train should equal
+            # (min_clearance_global_min - cbf.r_safety_margin).
+            _ob = base_env.obstacles
+            pad_inf = float(getattr(_ob, "inflation", 0.0) or 0.0)
+            pad_cen = pad_inf + float(getattr(_ob, "drone_radius", 0.0) or 0.0)
+            rep["clearance_pad_inflation"] = round(pad_inf, 4)
+            rep["clearance_pad_center"] = round(pad_cen, 4)
+            rep["clearance_conv_note"] = ("min_clearance_global_min is the CBF/raw "
+                                          "convention; +pad_inflation = surface; "
+                                          "+pad_center = centre")
+            rep["min_clearance_surface_global_min"] = round(float(f.min()) + pad_inf, 4)
+            rep["min_clearance_center_global_min"] = round(float(f.min()) + pad_cen, 4)
+            rep["min_clearance_surface_env_mean"] = round(float(f.mean()) + pad_inf, 4)
+    # ---- [2026-09-16] plan 4.2 trajectory metrics that the aggregator was MISSING ----
+    #   These were listed in the plan 4.2 table but never measured, so the "all gates
+    #   pass" line for A3/A4 was missing three of its own rows.  Definitions come from
+    #   NAVVEL_RETRAIN_GUIDE.md: z_err RMSE = RMSE of |z - z_goal| over the rollout;
+    #   terminal speed = mean |v_xy| over the LAST 0.5 s; path length ratio = arc length
+    #   / straight-line distance.
+    if _acc.z_n:
+        rep["z_err_rmse"] = round(math.sqrt(_acc.z_sq_sum / _acc.z_n), 4)
+        rep["z_err_n"] = int(_acc.z_n)
+    if _acc.term_buf:
+        tw = torch.stack(list(_acc.term_buf), 0)                # (<=W, N, 1)
+        tv = tw[torch.isfinite(tw)]
+        if tv.numel():
+            rep["terminal_speed_xy"] = round(float(tv.mean()), 4)
+        # audit the window: it must be ~0.5 s, otherwise the gate is measuring a
+        # different horizon than the guide's definition says it does
+        rep["terminal_speed_win_steps"] = int(tw.shape[0])
+        rep["terminal_speed_win_sec"] = round(tw.shape[0] * _acc.dt, 3)
+    if _acc.term_z_buf:
+        zw = torch.stack(list(_acc.term_z_buf), 0)
+        zv = zw[torch.isfinite(zw)]
+        if zv.numel():
+            rep["terminal_z_err"] = round(float(zv.mean()), 4)
+    if _acc.straight is not None:
+        d0 = _acc.straight.squeeze(-1)
+        plr = _acc.path_len.squeeze(-1) / d0.clamp(min=1e-6)
+        fin = torch.isfinite(plr) & (d0 > 1e-6)
+        if bool(fin.any()):
+            rep["path_length_ratio"] = round(float(plr[fin].mean()), 4)
     rep["cbf_extra"] = round(float(getattr(base_env, "cbf_extra", 0.0) or 0.0), 4)
     if cbf_filter is not None and cbf_filter.diag_tensor() is not None:
         dg = cbf_filter.diag_tensor().reshape(-1, 4)
@@ -590,7 +690,18 @@ def main(cfg):
     for k in ("arrival_at", "notarrived_step_frac", "stall_frac", "collision_envs",
               "collision_edges", "oob_envs_ever", "crash_envs_ever",
               "joint_success_envs", "min_clearance_global_min",
-              "min_clearance_env_mean", "h_min_train", "h_below0_frac",
+              "min_clearance_env_mean",
+              # [2026-09-16] the two extra clearance conventions (see the comment where
+              # they are computed) - printed so the plan's ambiguous `min d_min >= 0.10`
+              # can be adjudicated from one run instead of three.
+              "clearance_pad_inflation", "clearance_pad_center",
+              "min_clearance_surface_global_min", "min_clearance_center_global_min",
+              "min_clearance_surface_env_mean",
+              # [2026-09-16] plan 4.2 rows that were never measured before
+              "z_err_rmse", "z_err_n", "terminal_z_err",
+              "terminal_speed_xy", "terminal_speed_win_steps", "terminal_speed_win_sec",
+              "path_length_ratio",
+              "h_min_train", "h_below0_frac",
               "zero_intervention_rate", "intervened_step_frac", "corr_mean",
               "corr_p50", "corr_p95", "dropped_relevant_frac",
               "dropped_relevant_step_frac", "relevant_obstacles_total",

@@ -36,6 +36,22 @@ METRIC_ORDER = [
     #   a spread; a single distinct value means the randomization has stopped varying.
     "active_pillars_min", "active_pillars_mean", "active_pillars_max",
     "active_pillars_distinct",
+    # [2026-09-16] plan 4.2 rows that were never collected before, plus the three clearance
+    #   conventions.  These MUST be listed here: `row()` is only called for keys in this
+    #   list, so a metric that eval_ckpt emits but this list omits never reaches
+    #   out["summary"] and every gate reading it silently becomes None.  That is how
+    #   `min d_min` went missing from the gate table in the first place, and it is the same
+    #   way the clearance pads vanished on the first run of the new code.
+    "clearance_pad_inflation", "clearance_pad_center",
+    "min_clearance_surface_global_min", "min_clearance_center_global_min",
+    "min_clearance_surface_env_mean",
+    "z_err_rmse", "z_err_n", "terminal_z_err",
+    "terminal_speed_xy", "terminal_speed_win_steps", "terminal_speed_win_sec",
+    "path_length_ratio",
+    # `cbf_extra` is the CBF's own extra margin = safety_radius_extra(...) = r_safety_margin
+    #   when the brake term is off (profile A).  It is the quantity plan 4.2's numeric d_min
+    #   bar actually constrains, so it has to reach the summary to be gateable.
+    "cbf_extra",
 ]
 
 
@@ -81,6 +97,16 @@ def main():
     ap.add_argument("--label", default="unnamed")
     ap.add_argument("--allow-partial", action="store_true",
                     help="emit the table even if some logs have no [eval_metrics] line")
+    ap.add_argument("--d-min-inflation-pad", type=float, default=None, metavar="M",
+                    help="legacy logdirs only: the `inflation` cushion, needed to convert "
+                         "min_clearance_global_min into the SURFACE convention.  Profile A "
+                         "uses 0.02.  Do not hardcode; eval_ckpt reports it as "
+                         "clearance_pad_inflation.")
+    ap.add_argument("--d-min-pad", type=float, default=None, metavar="M",
+                    help="legacy logdirs only: inflation + drone_radius, needed to convert "
+                         "min_clearance_global_min into the CENTRE convention.  Profile A "
+                         "uses 0.12.  Do not hardcode; eval_ckpt reports "
+                         "clearance_pad_center.")
     args = ap.parse_args()
 
     runs = load(args.logdir)
@@ -219,44 +245,145 @@ def main():
     int_steps_on = round(int_on * _steps, 1) if (int_on is not None and _steps) else None
     int_steps_off = round(int_off * _steps, 1) if (int_off is not None and _steps) else None
 
-    out["gates"] = {
-        # --- A: closure gate (coarse) + the ordering metrics -------------------------
+    # [2026-09-16] CLEARANCE CONVENTIONS - the plan's `min d_min >= 0.10` is UNDECIDED.
+    #   `ObstacleManager.clearances()` returns |p-p_oi| - (r_oi + drone_radius + inflation).
+    #   The env header (nav_vel_obstacles.py L27-28) says drone_radius is the drone's
+    #   physical sphere and inflation is an extra cushion, so that raw number is
+    #   drone-surface-to-obstacle-surface MINUS the cushion.  Three documents then reuse the
+    #   name `d_min` for three different quantities, and the difference is not cosmetic on
+    #   profile A (pads 0.02 / 0.12 m): the observed minimum is 0.0501, so
+    #       cbf     = 0.0501  -> FAIL  (>= 0.10)
+    #       surface = 0.0701  -> FAIL
+    #       centre  = 0.1701  -> PASS
+    #   Earlier I "resolved" this by adding drone_radius+inflation back and declaring PASS,
+    #   which is only right under the CENTRE reading.  That was a guess dressed as a
+    #   conversion, so now all three are reported and the gate is not decided by me.
+    raw_on = m("min_clearance_global_min").get("on_mean")
+    pad_inf = m("clearance_pad_inflation").get("on_mean")
+    pad_cen = m("clearance_pad_center").get("on_mean")
+    if pad_inf is None:
+        pad_inf = args.d_min_inflation_pad      # legacy logdirs only
+    if pad_cen is None:
+        pad_cen = args.d_min_pad
+    dmin_cbf = raw_on
+    dmin_surface = m("min_clearance_surface_global_min").get("on_mean")
+    if dmin_surface is None and raw_on is not None and pad_inf is not None:
+        dmin_surface = round(raw_on + pad_inf, 4)
+    dmin_center = m("min_clearance_center_global_min").get("on_mean")
+    if dmin_center is None and raw_on is not None and pad_cen is not None:
+        dmin_center = round(raw_on + pad_cen, 4)
+    out["clearance_conventions"] = {
+        "raw_is": "cbf  (|p-p_oi| - (r_oi+drone_radius+inflation)); the CBF acts on this",
+        "pad_inflation_m": pad_inf,
+        "pad_center_m": pad_cen,
+        "min_cbf": dmin_cbf,
+        "min_surface(=cbf+pad_inflation)": dmin_surface,
+        "min_center(=cbf+pad_center)": dmin_center,
+        "plan_4.2_text": "`min d_min` | 全程最小表面净空 | >= 0.10 m",
+        "UNRESOLVED": ("plan 4.2 says 'surface clearance' but never fixes the origin; "
+                       "under `centre` A3/A4 pass 0.10, under `surface`/`cbf` they fail. "
+                       "Which one is meant must be settled in the plan, not inferred "
+                       "from which reading lets the rung pass."),
+    }
+
+    zn = m("z_err_rmse").get("on_mean")
+    vt = m("terminal_speed_xy").get("on_mean")
+    plr = m("path_length_ratio").get("on_mean")
+
+    cbf_extra_on = m("cbf_extra").get("on_mean")
+
+    # ---- PLAN 4.2: stage 1 (geometric generalisation) --------------------------------
+    # 4.1 is explicit that the two stages use DIFFERENT gate sets and disagree about the
+    # same metric on purpose: "CBF intervention rate" is "record only, high is allowed" in
+    # stage 1 and "zero-intervention rate >= 0.95" in stage 2.  Keeping them in one table
+    # is what let me call zero_intervention_rate a stage-1 blocker when 4.1 says it is not.
+    out["gates_stage1"] = {
         "arrival@0.2_gate>=0.85": None if arr_on is None else arr_on >= 0.85,
+        # Three rows because the plan's convention is undecided; see above.  Whichever the
+        # plan picks, the other two stay visible so the choice cannot hide a failure.
+        # [2026-09-16] DECISION (user, this date): the numeric clearance bar moves OFF
+        #   `min d_min` and ONTO the CBF's own margin.  Reason, established by MEASUREMENT
+        #   rather than by reading: with the filter ON the observed `min d_min` tracks
+        #   `cbf_extra` and nothing else (A3/A4: cbf_extra = 0.05 -> min = 0.0501 with
+        #   h_min = 0.0001), so `min d_min >= 0.10` is not a claim about the policy - it is
+        #   a claim about a config constant that no rollout can move.  Gating it would have
+        #   made a controller question look answered by a number the controller cannot
+        #   influence.  So `min d_min` is RECORDED in all three conventions and the gate
+        #   goes on `cbf_extra` itself (which for profile A equals cbf.r_safety_margin).
+        #   Caveat kept on the record: A0 is a counter-example to "h_min == 0 always" - its
+        #   cbf_extra is 0.10 yet min d_min was 0.0512 with h_min = -0.05, i.e. an
+        #   over-constrained filter can overshoot its own boundary.  So h_min >= 0 is
+        #   evidence about the filter, not about the clearance floor.
+        "cbf_extra_gate>=0.10": (None if cbf_extra_on is None else cbf_extra_on >= 0.10),
+        "zero_collision_gate(ON and OFF)": (None if m("collision_envs")["on_mean"] is None
+                                            else m("collision_envs")["on_mean"] == 0
+                                            and m("collision_envs")["off_mean"] == 0),
+        "zero_oob_gate(ON and OFF)": (m("oob_envs_ever")["on_mean"] == 0
+                                      and m("oob_envs_ever")["off_mean"] == 0),
+        "dropped_relevant_frac_gate<0.01": (m("dropped_relevant_frac")["on_mean"] or 0) < 0.01,
+        # "not worse than A0" - needs the v1.0.0 baseline to compare, so these stay n/a until
+        # the baseline values are recorded; the guide's absolute bars are 0.10 m / 0.15 m/s.
+        "z_err_rmse_gate(not worse than A0)": None,
+        "terminal_speed_gate(not worse than A0)": None,
+        # ---- stage-1 RECORD-ONLY (4.2 says "record", not gate) ----------------------
+        "info_stage1_cbf_intervened_step_frac": m("intervened_step_frac")["on_mean"],
+        "info_stage1_cbf_intervened_steps_ON/OFF": [int_steps_on, int_steps_off],
+        # plan 4.2 `min d_min`: RECORDED, in all three conventions (see the decision above)
+        "info_min_d_min_cbf": dmin_cbf,
+        "info_min_d_min_surface": dmin_surface,
+        "info_min_d_min_center": dmin_center,
+        "info_cbf_extra_ON/OFF": [cbf_extra_on, m("cbf_extra").get("off_mean")],
+        "info_h_min_train_ON": m("h_min_train").get("on_mean"),
+        "info_arrival_steps_median_ON/OFF": speed_cost,
+        "info_z_err_rmse": zn,
+        "info_terminal_speed_xy": vt,
+        "info_path_length_ratio": plr,
+        "info_active_pillars_mean": m("active_pillars_mean")["on_mean"],
+    }
+
+    # ---- PLAN 4.3: stage 2 (remove the runtime filter) -------------------------------
+    zero_int = (None if int_steps_on is None or not _steps
+                else round(1.0 - int_steps_on / _steps, 4))
+    out["gates_stage2"] = {
+        "filter_dependency_gate>=0.95": None if dep is None else dep >= 0.95,
+        "zero_intervention_rate_gate>=0.95": None if zero_int is None else zero_int >= 0.95,
+        # The SAME gate expressed in absolute steps.  This is the correction to a mistake of
+        # mine: on 2026-09-14 I replaced zero_intervention_rate with `intervened_steps <=
+        # 300` - a number with no basis in the plan, chosen because A4 happened to pass it at
+        # 238.  300 steps at T=1500 is a rate of 0.80, i.e. it silently RELAXED the stage-2
+        # bar by 4x.  The plan's 0.95 at T=1500 means <= 0.05*T = 75 steps.
+        "zero_intervention_steps_equiv<=0.05*T": (None if int_steps_on is None or not _steps
+                                                  else int_steps_on <= 0.05 * _steps),
+        "h_min_train_gate>=0": (m("h_min_train")["on_mean"] or 0) >= 0.0
+        if m("h_min_train")["on_mean"] is not None else None,
+        "cbf_extra_gate>=0.10": (None if cbf_extra_on is None else cbf_extra_on >= 0.10),
+        "info_min_d_min_surface": dmin_surface,
+        "zero_collision_gate(ON and OFF)": (None if m("collision_envs")["on_mean"] is None
+                                            else m("collision_envs")["on_mean"] == 0
+                                            and m("collision_envs")["off_mean"] == 0),
+        "stall_gate<=0.10": (m("stall_frac")["on_mean"] or 0) <= 0.10,
+        "arrival@0.2_OFF_gate>=0.85": None if arr_off is None else arr_off >= 0.85,
+        "info_ex_mine_intervened_steps<=300(no basis in plan)": int_steps_on,
+    }
+
+    # Kept flat for backwards compatibility with anything reading out["gates"]; it is the
+    # stage-1 set plus the retired monitors, which is what the old single table held.
+    out["gates"] = {
+        "arrival@0.2_gate>=0.85": out["gates_stage1"]["arrival@0.2_gate>=0.85"],
         "arrival_steps_median_ON/OFF": speed_cost,
-        # --- B: filter cost, RECORD-ONLY (user decision 2026-09-14 20:0x) ------------
-        # The metric is nearly horizon-stable but not exactly: drift is +0.0022 (A2L3) to
-        # +0.0092 (A1a), so a hard threshold at 1.10 flips A1a's verdict between protocols
-        # (1.0991 at 600 PASS vs 1.1083 at 1500 FAIL).  A verdict that flips with the
-        # protocol is not a verdict, so this is a monitor, not a gate.  The reason it is
-        # not promoted even with margin: at 1500 steps arrival_OFF is already 0.983-0.996,
-        # i.e. the filter barely affects the ARRIVAL RATE any more - its real value shows up
-        # in COLLISIONS, and the collision gate below carries that dimension.
         "info_filter_speed_cost_on_over_off(warn>1.10)": speed_cost,
-        # --- C: absolute intervention budget (horizon-free) --------------------------
-        "intervened_steps_gate<=300": None if int_steps_on is None else int_steps_on <= 300,
-        # --- D: the filter must not collide; the shadow run only needs recording -----
         "zero_collision_ON_gate": (m("collision_envs")["on_mean"] == 0
                                    if m("collision_envs")["on_mean"] is not None else None),
         "collision_envs_OFF_recorded": m("collision_envs")["off_mean"],
         "zero_oob_gate": (m("oob_envs_ever")["on_mean"] == 0
                           and m("oob_envs_ever")["off_mean"] == 0),
-        "h_min_train_gate>=0": (m("h_min_train")["on_mean"] or 0) >= 0.0
-        if m("h_min_train")["on_mean"] is not None else None,
-        "stall_gate<=0.10": (m("stall_frac")["on_mean"] or 0) <= 0.10,
-        # --- informational only (NOT gates) ------------------------------------------
+        "h_min_train_gate>=0": out["gates_stage2"]["h_min_train_gate>=0"],
+        "stall_gate<=0.10": out["gates_stage2"]["stall_gate<=0.10"],
         "info_filter_dependency_OFF_over_ON(retired)": dep,
-        "info_zero_intervention_rate(horizon_ruler)": m("zero_intervention_rate")["on_mean"],
+        "info_zero_intervention_rate(horizon_ruler)": m("zero_intervention_rate").get("on_mean"),
         "info_intervened_steps_ON/OFF": [int_steps_on, int_steps_off],
-        # [2026-09-14] NAME THE METRIC.  These used to be one entry called
-        # `dropped_relevant_gate`, which conflated two different quantities:
-        #   * dropped_relevant_frac      = share of *obstacles* that were relevant but
-        #                                  fell outside the K-slot obs window
-        #   * dropped_relevant_step_frac = share of *steps* that lost >=1 such obstacle
-        # On A2 (ON) they are 0.0032 vs 0.1886 - about 60x apart.  So the old gate said
-        # PASS while the plan's 3.2 escalation criterion was already exceeded, i.e. the
-        # trigger was masked by a same-prefix name.  This entry now measures exactly what
-        # its name says, and the escalation rule is reported separately below.
-        "dropped_relevant_frac_gate<0.01": (m("dropped_relevant_frac")["on_mean"] or 0) < 0.01,
+        "dropped_relevant_frac_gate<0.01": out["gates_stage1"]["dropped_relevant_frac_gate<0.01"],
+        "cbf_extra_gate>=0.10": out["gates_stage1"]["cbf_extra_gate>=0.10"],
     }
     step_on = m("dropped_relevant_step_frac")["on_mean"]
     out["triggers"] = {
@@ -277,27 +404,31 @@ def main():
              f"   !! layout_fp MISMATCH for seeds {fp_bad} - ON/OFF not the same layout"))
     print()
     print("\n".join(lines))
-    print("\ngates (plan 4.1/4.3, redesigned 2026-09-14 - see plan 0.6.7):")
+    print("\ngates (plan 4.2 / 4.3, split by stage 2026-09-16 - see plan 0.6.7):")
+    print("  -- plan 4.2, STAGE 1 (geometric generalisation) --")
     _warn = []
-    for k, v in out["gates"].items():
-        if k.startswith("info_"):
-            # retired / horizon-dependent quantities kept for the record only.  They must
-            # never show up as PASS/FAIL, because that is exactly how the old
-            # filter_dependency and zero_intervention_rate gates misled: both looked like
-            # real gates but were functions of the rollout length.
-            mark = "INFO"
+    for label, table in (("stage1", out["gates_stage1"]), ("stage2", out["gates_stage2"])):
+        if label == "stage2":
+            print("  -- plan 4.3, STAGE 2 (remove the runtime filter) - shown for "
+                  "forward-looking information; a stage-1 batch is not expected to pass "
+                  "these --")
+        for k, v in table.items():
+            if k.startswith("info_"):
+                mark = "INFO"
+            elif isinstance(v, bool):
+                mark = "PASS" if v else "FAIL"
+            elif v is None:
+                mark = "n/a"
+            else:
+                mark = "VALUE"
             # [2026-09-14] The speed-cost metric is horizon-stable but not horizon-EXACT:
             # drift between 600 and 1500 steps is +0.0022 (A2L3) to +0.0092 (A1a), up to
-            # 0.9%.  It is record-only (see the comment on the gate dict), but exceeding
-            # 1.10 still deserves a warning that accumulates for the margin decision.
+            # 0.9%.  It is record-only, but exceeding 1.10 still deserves a warning that
+            # accumulates for the margin decision.
             if "filter_speed_cost" in k and isinstance(v, float) and v > 1.10:
                 _warn.append(f"`filter_speed_cost` = {v} > 1.10 (record-only; needs a "
                              "margin decision before it can gate)")
-        elif isinstance(v, bool) or v is None:
-            mark = "PASS" if v is True else ("FAIL" if v is False else "n/a")
-        else:
-            mark = "VALUE"
-        print(f"  [{mark}] {k} = {v}")
+            print(f"  [{mark}] {k} = {v}")
     for w in _warn:
         print(f"  [WARN] {w}")
 
