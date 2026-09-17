@@ -244,8 +244,13 @@ def main():
     speed_cost = round(med_on / med_off, 4) if (med_on and med_off) else None
 
     _steps = int(runs[0].get("rollout_steps") or 0)
-    int_on = m("intervened_step_frac")["on_mean"]
-    int_off = m("intervened_step_frac")["off_mean"]
+    # [P3 2026-09-17] `.get()` not `[]`: the naive arm (cbf.mode=none) has no CBF
+    #   transform, so eval_ckpt.py never emits `intervened_step_frac` (unlike
+    #   `h_min_train`/`zero_intervention_rate` which it emits as None).  `m()` then
+    #   returns {} and the old `["on_mean"]` raised KeyError, aborting the whole
+    #   aggregation.  A missing CBF metric must read as n/a, never as a crash (pit 14).
+    int_on = m("intervened_step_frac").get("on_mean")
+    int_off = m("intervened_step_frac").get("off_mean")
     int_steps_on = round(int_on * _steps, 1) if (int_on is not None and _steps) else None
     int_steps_off = round(int_off * _steps, 1) if (int_off is not None and _steps) else None
 
@@ -388,7 +393,7 @@ def main():
         "z_err_rmse_gate(not worse than A0)": (rel.get("z_err_rmse") or {}).get("pass"),
         "terminal_speed_gate(not worse than A0)": (rel.get("terminal_speed_xy") or {}).get("pass"),
         # ---- stage-1 RECORD-ONLY (4.2 says "record", not gate) ----------------------
-        "info_stage1_cbf_intervened_step_frac": m("intervened_step_frac")["on_mean"],
+        "info_stage1_cbf_intervened_step_frac": m("intervened_step_frac").get("on_mean"),
         "info_stage1_cbf_intervened_steps_ON/OFF": [int_steps_on, int_steps_off],
         # plan 4.2 `min d_min`: RECORDED, in all three conventions (see the decision above)
         "info_min_d_min_cbf": dmin_cbf,
